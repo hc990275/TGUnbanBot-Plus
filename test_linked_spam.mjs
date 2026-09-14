@@ -99,7 +99,8 @@ check('不同文案哈希不同', k1.hash !== k3.hash);
 // 线上两次漏放的原因（「来跑分 一天1万」「来洗钱 挣8千」都是 8 字，恰好被放过）。
 // 门槛降到 4 字后这条必须能进；下限只防「在吗」这类退化情形，详见第 10.5 组。
 check('8 字短广告可进连带（旧 12 字门槛已废除）', W.buildModerationTextKey({ text: '来跑分 一天1万' }) !== null);
-check('过短文案仍被拦（4 字下限）', W.buildModerationTextKey({ text: '在吗' }) === null);
+check('2 字广告也可进连带（4 字下限亦已废除，线上「5迁」被放过）',
+	W.buildModerationTextKey({ text: '5迁' }) !== null);
 check('斜杠命令不参与连带', W.buildModerationTextKey({ text: '/ban 1919451354 广告号' }) === null);
 
 console.log('\n=== 3. 灌入缓存（5 号刷同款 × 2 群 + 2 个正常号）===');
@@ -249,12 +250,16 @@ console.log('\n=== 10.5 门槛 4 字：短广告必须能进（线上两次漏�
 // 原先照搬「整段正文指纹」的 12 字门槛是判据错配 —— 那道门槛防的是【自动学习】误伤，
 // 而连带的前提是第一主人亲自 /spam，已经过最强人工判定。
 // 线上两个真实短广告都是 8 字，全被 12 字门槛放过。
-for (const short of ['来跑分 一天1万', '来洗钱 挣8千', '来洗钱挣8千']) {
+// 长度门槛调过三轮、每轮都被新样本打穿（12 字放过 8 字广告，4 字放过「5迁」），
+// 现已彻底取消 —— 判据只剩「第一主人 /spam 过就算」。
+// 这批用例全部取自线上真实漏放样本，从 8 字一路到 2 字。
+for (const short of ['来跑分 一天1万', '来洗钱 挣8千', '来洗钱挣8千', '来洗钱吧', '5迁', '收U']) {
 	const k = W.buildModerationTextKey({ text: short });
-	check('短广告可进连带 [' + short + ']', k !== null, k ? '归一化 ' + k.norm.length + ' 字' : '被拒');
+	check('任意长度广告可进连带 [' + short + ']', k !== null, k ? '归一化 ' + k.norm.length + ' 字' : '被拒');
 }
-check('4 字下限仍拦住退化情形（「在吗」）', W.buildModerationTextKey({ text: '在吗' }) === null);
-check('恰好 4 字可进', W.buildModerationTextKey({ text: '来洗钱吧' }) !== null);
+check('空文案仍不参与（没有可比对的内容）', W.buildModerationTextKey({ text: '   ' }) === null);
+check('斜杠命令仍不参与（操作指令不是广告内容）',
+	W.buildModerationTextKey({ text: '/ban 123456' }) === null);
 
 console.log('\n=== 11. 旧库降级写入（线上事故回归）===');
 // 线上真实故障：D1_SCHEMA_VERSION 没提 → ensureD1Table 在 version >= 目标版本时短路 →
