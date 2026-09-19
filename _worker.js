@@ -5451,9 +5451,19 @@ async function loadRecentLearnCandidates(env, sourceChatId, limit) {
 				hints: scored.hints
 			});
 		}
+		// ===== 过滤明确正常的发言（2026-09-12 主人选定方案一 + 四）=====
+		// 【口径刻意是「排除明确正常的」，不是「筛出像广告的」】——这两者方向相反：
+		// 按「像广告」筛，现有判据抓不到的【新形态】广告就永远进不了候选、事后也捞不回来，
+		// 而 /recent 存在的意义恰恰是捞回漏掉的那些（旧代码 looksLikeAdCandidate 就栽在这儿，
+		// 当初刻意没照搬）。所以只砍掉「三项判据一个都没命中」的零特征条目，
+		// 有任何一丝特征就保留。
+		//
+		// 方案四：多号刷同一段文案【无条件放行】，即便文案本身零特征 ——
+		// 那本身就是强广告信号，线上「5迁」这种两字文案正是靠这条兜住的。
+		const filtered = items.filter((it) => it.weight > 0 || it.senderCount > 1);
 		// 先按特征权重降序，同权重按「刷的号数」降序 —— 多号刷同一段文案本身就是广告信号。
-		items.sort((a, b) => (b.weight - a.weight) || (b.senderCount - a.senderCount));
-		return items.slice(0, Math.max(1, Math.min(RECENT_LEARN_MAX_ITEMS, Number(limit) || RECENT_LEARN_MAX_ITEMS)));
+		filtered.sort((a, b) => (b.weight - a.weight) || (b.senderCount - a.senderCount));
+		return filtered.slice(0, Math.max(1, Math.min(RECENT_LEARN_MAX_ITEMS, Number(limit) || RECENT_LEARN_MAX_ITEMS)));
 	} catch (error) {
 		console.error('[学习候选] 读取失败:', error);
 		return [];
@@ -13752,7 +13762,7 @@ async function handleAdRecentCommand(message, env, ctx) {
 
 	const lines = [
 		'📋 <b>学习候选快照</b>（' + escapeHtml(scopeLabel) + ' · ' + items.length + ' 条 · 已冻结）',
-		'按广告特征强度排序，命中特征的在前。',
+		'已排除零特征的正常发言；多号刷同款的一律保留。按特征强度排序。',
 		''
 	];
 	items.forEach((it, i) => {

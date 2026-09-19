@@ -106,13 +106,22 @@ check('同款文案去重（3 个号刷 AD1 只占 1 条）',
 check('去重后仍记录刷广告的号数',
 	items.find((i) => i.text === W.normalizeAdFingerprintValue(AD1))?.senderCount === 3,
 	'senderCount=' + items.find((i) => i.text === W.normalizeAdFingerprintValue(AD1))?.senderCount);
-check('4 条独立文案全部保留（不做预筛，新形态不漏）', items.length === 4, '实际 ' + items.length);
+// 【2026-09-12 方案一 + 四】过滤零特征的正常发言，但多号刷同款无条件放行。
+// 口径刻意是「排除明确正常的」而非「筛出像广告的」—— 后者会让新形态广告
+// 永远进不了候选，而 /recent 的意义正是捞回漏掉的那些。
 const idxAD2 = items.findIndex((i) => i.text === W.normalizeAdFingerprintValue(AD2));
-const idxChat = items.findIndex((i) => i.text === W.normalizeAdFingerprintValue(CHAT1));
-check('混淆广告排在闲聊之前（按特征强度排序）', idxAD2 < idxChat, 'AD2 第' + (idxAD2 + 1) + ' 位，闲聊第' + (idxChat + 1) + ' 位');
+const idxAD1 = items.findIndex((i) => i.text === W.normalizeAdFingerprintValue(AD1));
+check('混淆广告保留', idxAD2 >= 0);
+check('多号刷的同款保留（方案四：即便文案零特征也放行）', idxAD1 >= 0);
+check('零特征闲聊被过滤掉（CHAT1）',
+	!items.some((i) => i.text === W.normalizeAdFingerprintValue(CHAT1)),
+	'候选：' + items.map((i) => i.text.slice(0, 10)).join(' | '));
+check('零特征闲聊被过滤掉（CHAT2）',
+	!items.some((i) => i.text === W.normalizeAdFingerprintValue(CHAT2)));
+check('混淆广告排在多号同款之前（按特征强度排序）', idxAD2 < idxAD1,
+	'AD2 第' + (idxAD2 + 1) + ' 位，AD1 第' + (idxAD1 + 1) + ' 位');
 check('混淆形态被识别出提示', (items[idxAD2]?.hints || []).some((h) => h.includes('混淆')),
 	JSON.stringify(items[idxAD2]?.hints));
-check('闲聊无特征提示（权重 0）', items[idxChat]?.weight === 0, 'weight=' + items[idxChat]?.weight);
 
 console.log('\n=== 3.5 回执里每条候选带可点击命令 ===');
 {
@@ -128,9 +137,10 @@ console.log('\n=== 3.5 回执里每条候选带可点击命令 ===');
 		(body.match(/\/learnlast \d+/g) || []).slice(0, 4).join(' | '));
 	check('命令未被 <code> 包裹（否则只能复制不能点发）',
 		!/<code>\/learnlast \d+<\/code>/.test(body));
+	// 条数跟着实际候选走，不写死 —— 零特征过滤上线后候选数会随样本变化。
 	check('候选条数与可点击命令条数一致',
-		(body.match(/^\s*\/learnlast \d+$/gm) || []).length === 4,
-		'命令 ' + (body.match(/^\s*\/learnlast \d+$/gm) || []).length + ' 条 vs 候选 4 条');
+		(body.match(/^\s*\/learnlast \d+$/gm) || []).length === items.length,
+		'命令 ' + (body.match(/^\s*\/learnlast \d+$/gm) || []).length + ' 条 vs 候选 ' + items.length + ' 条');
 	check('多条学习的用法仍在说明里', /\/learnlast 1,3,5/.test(body));
 	check('上限已提到 200（旧代码是 50）', W.RECENT_LEARN_MAX_ITEMS === 200 || /200 条/.test(body) || true);
 }
@@ -138,17 +148,24 @@ console.log('\n=== 3.5 回执里每条候选带可点击命令 ===');
 console.log('\n=== 4. 冻结快照：序号不漂移（旧代码专治的坑）===');
 await W.saveLearnSnapshot(env, OWNER, items, '全部配置群');
 const snapBefore = await W.loadLearnSnapshot(env, OWNER);
-check('快照写入并可读回', snapBefore?.items?.length === 4);
-// 期间进来大量新消息，实时缓存被挤动
+const snapCount = items.length;
+check('快照写入并可读回', snapBefore?.items?.length === snapCount, '快照 ' + snapBefore?.items?.length + ' 条');
+// 期间进来大量【带特征】的新消息，实时候选被挤动。
+// 刻意用带混淆签名的文案而不是闲聊 —— 零特征过滤上线后，灌闲聊压根进不了候选，
+// 那样这条对照断言就失去意义了（它要证明的是「不冻结就会漂移」）。
 for (let i = 0; i < 20; i += 1) {
 	mid += 1;
-	await W.cacheModerationMessage(env, { message_id: mid, chat: { id: GROUPS[0] }, from: { id: '95' + i }, text: '新来的消息 ' + i });
+	await W.cacheModerationMessage(env, {
+		message_id: mid, chat: { id: GROUPS[0] }, from: { id: '95' + i },
+		text: '新.來.的.廣.告 ' + i
+	});
 }
 const snapAfter = await W.loadLearnSnapshot(env, OWNER);
 check('新消息涌入后快照内容完全不变（序号永不漂移）',
 	JSON.stringify(snapAfter.items) === JSON.stringify(snapBefore.items));
-const liveNow = await W.loadRecentLearnCandidates(env, '', 50);
-check('而实时查询确实已被挤动（证明冻结是必要的）', liveNow.length > 4, '实时 ' + liveNow.length + ' 条 vs 快照 4 条');
+const liveNow = await W.loadRecentLearnCandidates(env, '', 200);
+check('而实时查询确实已被挤动（证明冻结是必要的）', liveNow.length > snapCount,
+	'实时 ' + liveNow.length + ' 条 vs 快照 ' + snapCount + ' 条');
 
 console.log('\n=== 5. /learnlast 按序号学习 ===');
 sent.length = 0;
@@ -185,8 +202,10 @@ sent.length = 0;
 await W.handleAdLearnLastCommand(env, OWNER, OWNER, 'abc');
 check('非数字参数被拒', sent.some((s) => s.text.includes('有效序号')));
 sent.length = 0;
-await W.handleAdLearnLastCommand(env, OWNER, OWNER, '2,2,3');
-check('重复序号去重后执行', sent.some((s) => s.text.includes('已学习 2 条')), sent[0]?.text?.slice(0, 40));
+// 用 1,1,2 而非 2,2,3：零特征过滤后快照只有 2 条，序号 3 已越界。
+await W.handleAdLearnLastCommand(env, OWNER, OWNER, '1,1,2');
+check('重复序号去重后执行（1,1,2 → 学 2 条）',
+	sent.some((s) => s.text.includes('已学习 2 条')), sent[0]?.text?.slice(0, 40));
 
 console.log('\n=== 7. 无快照时的引导 ===');
 sent.length = 0;
