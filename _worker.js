@@ -5357,7 +5357,12 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 // 序号必须来自冻结快照而不是实时查询：moderation_messages 被每条群消息持续写入并按容量剪枝，
 // 若 /learnlast 重查一次实时数据，期间进来的新消息会把列表整体挤动，
 // 主人看到的「3 号」和实际学到的就不是同一条了。旧代码专门治过这个坑。
-const RECENT_LEARN_MAX_ITEMS = 50;
+// 上限 200：旧代码写死 50，但那是「只缓存疑似广告」时代的数字 ——
+// 本项目缓存全部消息、只排序不预筛，50 条很容易被闲聊占满而挤掉靠后的真广告。
+// 200 条的依据：回执走 sendTelegramMessageChunks 自动分片，不受单条 4096 字符限制；
+// 每条候选约两行、120 字符上下，200 条约 24 KB → 分 6~7 条消息，可接受。
+// 再往上就不是技术限制而是可读性问题了：人工逐条核对 200 条已是上限。
+const RECENT_LEARN_MAX_ITEMS = 200;
 const RECENT_LEARN_LOOKBACK_MS = 48 * 60 * 60 * 1000;
 
 // 给候选打分排序：命中过特征的排前面，纯闲聊沉底。
@@ -5399,9 +5404,11 @@ async function loadRecentLearnCandidates(env, sourceChatId, limit) {
 		await ensureD1Table(env);
 		// text_norm IS NOT NULL 过滤掉无正文的消息（图片、服务消息等）。
 		// 多取一些再排序截断 —— 排序键是特征权重，不是时间，所以不能只取最新 N 条。
+		// LIMIT 1500 是为了配合 RECENT_LEARN_MAX_ITEMS=200：取样池必须远大于输出上限，
+		// 否则同款去重后不足 200 条，等于上限白提（原先取 300 只够支撑 50 条输出）。
 		const sql = scopeCurrentGroup
-			? 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND created_at >= ? AND chat_id = ? ORDER BY id DESC LIMIT 300'
-			: 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND created_at >= ? ORDER BY id DESC LIMIT 300';
+			? 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND created_at >= ? AND chat_id = ? ORDER BY id DESC LIMIT 1500'
+			: 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND created_at >= ? ORDER BY id DESC LIMIT 1500';
 		const stmt = scopeCurrentGroup
 			? env.DB.prepare(sql).bind(sinceIso, String(sourceChatId))
 			: env.DB.prepare(sql).bind(sinceIso);
@@ -7742,6 +7749,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/delword noise　批量删掉命中 0 次的噪声指纹（需二次确认，不动种子）',
 			'/delword type:username　批量删掉整类指纹（需二次确认，不动种子）',
 			'/addsample 文本　新增 AI 语义比对样本',
+			'/recent [N]　捞回已被删掉的广告：拉最近 48 小时缓存正文，按广告特征强度排序后冻结快照推私聊',
+			'　　群内也能发（命令消息会撤回、列表只走私聊）。默认 ' + RECENT_LEARN_MAX_ITEMS + ' 条，可写 /recent 20 限量',
+			'　　治的是「广告被别的 bot 抢先删掉 → 没法引用回复 /spam → 特征永久漏学」',
+			'/learnlast 序号　按 /recent 快照的序号学习，如 /learnlast 3 或 /learnlast 1,3,5',
+			'　　入指纹库 + AI 样本库，并<b>直接加黑 + 全群封禁</b>该条的发送者',
+			'　　判错用回执里现成的 /unban 一键回滚；超预算时自动转批量任务',
 			'/warmup　补齐样本向量（向量为 0 时第三层 AI 不生效，反复发直到补满）',
 			'/clearsamples　清空全部 AI 样本，需二次确认令牌',
 			'/whitelist [list|add|del] [域名]　维护域名白名单，命中即豁免',
@@ -13749,11 +13762,16 @@ async function handleAdRecentCommand(message, env, ctx) {
 		if (it.senderCount > 1) meta.push(it.senderCount + ' 个号发过');
 		meta.push('TGID <code>' + escapeHtml(it.fromId) + '</code>');
 		lines.push('   — ' + meta.join('　'));
+		// 每条候选直接跟一条【裸文本】命令：Telegram 只把纯文本里的 /xxx 识别成命令实体、
+		// 支持点一下直接发送；包进 <code> 就只能点击复制，还得手动粘贴再补序号。
+		// 这与 /help 清单的处理口径一致（那边同样刻意写裸文本，见 handleHelpCommand 注释）。
+		lines.push('   /learnlast ' + (i + 1));
 	});
 	lines.push('');
 	lines.push('✅ <b>请私聊我</b>核对后学习（群内不能学）：');
-	lines.push('学一条：<code>/learnlast 3</code>　学多条：<code>/learnlast 1,3,5</code>');
-	lines.push('⚠️ 学习只入指纹库与 AI 样本库，<b>不封禁任何人</b>；要封发广告的号请复制上面 TGID 用 <code>/ban</code> 或 <code>/spam</code>。');
+	lines.push('单条直接点上面对应的 /learnlast 序号即可发送；');
+	lines.push('多条手打一条即可，如 /learnlast 1,3,5');
+	lines.push('⚠️ 学习会<b>同时加黑并全群封禁</b>该条的发送者，判错用回执里的 <code>/unban</code> 一键回滚。');
 
 	await replyToAdmin(message, ctx, {
 		flashText: '📋 ' + items.length + ' 条学习候选已推送私聊',
@@ -13788,10 +13806,15 @@ async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
 	const lines = ['📖 <b>已学习 ' + indices.length + ' 条</b>（序号 ' + indices.join(',') + '）', ''];
 	let learnedTotal = 0;
 	let sampleTotal = 0;
+	// 发广告的号：学完顺手加黑 + 全群封禁，不必再手动发 /ban。
+	// 【为什么能直接封】能进这一步的前提是第一主人已经逐条核对过快照内容 ——
+	// 与 /spam 同等的人工判定强度，没有理由再让他多打一条命令。
+	const banTargets = new Set();
 	for (const idx of indices) {
 		const it = list[idx - 1];
 		if (!it) continue;
 		const text = String(it.text || '');
+		if (it.fromId && /^\d+$/.test(String(it.fromId))) banTargets.add(String(it.fromId));
 		// source 用 'learnlast'：不是 'auto' → 自动跳过 learnAdFingerprints 的强动词闸门
 		//（人工判定不需要那道防自动学习的闸）；又不是 'manual' → 仍受误报退役机制约束，
 		// 万一学错了，/ignore 累计误报后能自动清掉，不会留成永久误封源。
@@ -13813,7 +13836,52 @@ async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
 	}
 	lines.push('');
 	lines.push('合计：指纹 <b>+' + learnedTotal + '</b>　AI 样本 <b>+' + sampleTotal + '</b>');
-	lines.push('ℹ️ 学习只入库，<b>未封禁任何人</b>。要封号请用 <code>/ban TGID</code> 或引用回复 <code>/spam</code>。');
+
+	// ===== 处置发广告的号：加黑 + 全群封禁（2026-09-12 主人要求）=====
+	// 同步 / 批量的分流【按子请求预算动态判断】，与连带查杀同一套口径（shouldUseBulkQueue）——
+	// 离线实测 15 群时：1 个号 57 子请求（安全），3 个号 119 已超同步预算 100。
+	// 写死号数会在群数增长后失效，所以一律交给预算函数判断。
+	const targetIds = [...banTargets];
+	if (targetIds.length) {
+		lines.push('');
+		try {
+			if (shouldRunLinkedSpamSync(targetIds.length)) {
+				const done = [];
+				for (const uid of targetIds) {
+					const added = await addToBlacklist(uid, env, {
+						reason: 'spam', by: ownerId, note: '/learnlast 学习并处置'
+					});
+					const banResults = await banUserFromAllGroups(uid, { probeMembership: false });
+					const okCount = banResults.filter((r) => r?.ok).length;
+					done.push({ uid, code: String(added?.code || (added?.success ? 'ADDED' : 'ERROR')), ban: okCount + '/' + banResults.length });
+				}
+				lines.push('<b>已处置 ' + done.length + ' 个发广告的号</b>');
+				for (const d of done) {
+					lines.push('· <code>' + escapeHtml(d.uid) + '</code>　黑名单:'
+						+ (d.code === 'ADDED' ? '已加入' : d.code === 'EXISTS' ? '此前已在' : d.code)
+						+ '　封禁:' + d.ban);
+				}
+			} else {
+				// 超同步预算：转 D1 批量任务 + Queues 分片续接，复用既有机制。
+				const job = await createBulkJob(env, 'spam', targetIds, [], '/learnlast 学习并处置', {
+					chat: { id: chatId, type: 'private' },
+					from: { id: Number(ownerId) || 0 }
+				});
+				if (!getBulkQueue(env)) { job.autoContinue = false; await saveBulkJob(env, job); }
+				lines.push('<b>' + targetIds.length + ' 个发广告的号已转批量任务</b>（超同步子请求预算）');
+				lines.push('任务号:<code>' + escapeHtml(job.id) + '</code>　进度:<code>/job ' + escapeHtml(job.id) + '</code>');
+			}
+			lines.push('');
+			lines.push('判错一键回滚：<code>/unban ' + escapeHtml(targetIds.join(',')) + '</code>');
+		} catch (error) {
+			// 处置失败绝不回滚已完成的学习 —— 指纹与样本已经入库，那部分是有效成果。
+			console.error('[learnlast] 加黑/封禁失败:', error);
+			lines.push('⚠️ 学习已完成，但加黑/封禁出错：' + escapeHtml(String(error?.message || error)));
+			lines.push('可手动执行：<code>/ban ' + escapeHtml(targetIds.join(',')) + '</code>');
+		}
+	} else {
+		lines.push('ℹ️ 快照里没有可处置的发送者 TGID，仅完成入库。');
+	}
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
 

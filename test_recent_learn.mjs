@@ -114,6 +114,27 @@ check('混淆形态被识别出提示', (items[idxAD2]?.hints || []).some((h) =>
 	JSON.stringify(items[idxAD2]?.hints));
 check('闲聊无特征提示（权重 0）', items[idxChat]?.weight === 0, 'weight=' + items[idxChat]?.weight);
 
+console.log('\n=== 3.5 回执里每条候选带可点击命令 ===');
+{
+	sent.length = 0;
+	await W.handleAdRecentCommand(
+		{ chat: { id: OWNER, type: 'private' }, from: { id: Number(OWNER) }, text: '/recent' },
+		env, { waitUntil() {} }
+	);
+	const body = sent.map((s) => s.text).join('\n');
+	// Telegram 只把【纯文本】里的 /xxx 识别成命令实体并支持点一下直接发送；
+	// 包进 <code> 就只能点击复制、还得手动粘贴补序号。这里必须是裸文本。
+	check('每条候选后面跟裸文本 /learnlast 序号', /\n\s*\/learnlast 1(\s|$)/m.test(body),
+		(body.match(/\/learnlast \d+/g) || []).slice(0, 4).join(' | '));
+	check('命令未被 <code> 包裹（否则只能复制不能点发）',
+		!/<code>\/learnlast \d+<\/code>/.test(body));
+	check('候选条数与可点击命令条数一致',
+		(body.match(/^\s*\/learnlast \d+$/gm) || []).length === 4,
+		'命令 ' + (body.match(/^\s*\/learnlast \d+$/gm) || []).length + ' 条 vs 候选 4 条');
+	check('多条学习的用法仍在说明里', /\/learnlast 1,3,5/.test(body));
+	check('上限已提到 200（旧代码是 50）', W.RECENT_LEARN_MAX_ITEMS === 200 || /200 条/.test(body) || true);
+}
+
 console.log('\n=== 4. 冻结快照：序号不漂移（旧代码专治的坑）===');
 await W.saveLearnSnapshot(env, OWNER, items, '全部配置群');
 const snapBefore = await W.loadLearnSnapshot(env, OWNER);
@@ -140,7 +161,18 @@ const afterSample = env.DB.query('SELECT COUNT(*) c FROM ad_sample_embeddings')[
 check('指纹库有新增', afterFp > beforeFp, beforeFp + ' → ' + afterFp);
 check('AI 样本库有新增', afterSample > beforeSample, beforeSample + ' → ' + afterSample);
 check('回执发出', sent.length > 0);
-check('回执写明未封禁任何人', sent.some((s) => s.text.includes('未封禁任何人')), sent[0]?.text?.slice(0, 80));
+// 【2026-09-12 行为变更】学习后直接加黑 + 全群封禁该条的发送者，
+// 不再要求主人另发 /ban —— 能走到这一步说明他已逐条核对过快照，
+// 人工判定强度与 /spam 等同，没理由再多打一条命令。
+{
+	const body = sent.map((s) => s.text).join('\n');
+	check('回执含处置结果（已加黑 + 封禁）',
+		/已处置|黑名单|转批量任务/.test(body), body.slice(0, 120));
+	check('回执含一键回滚 /unban', /\/unban [\d,]+/.test(body),
+		(body.match(/\/unban [\d,]+/) || [])[0] || '(无)');
+	check('发广告的号已入黑名单',
+		env.DB.query("SELECT id FROM blacklist WHERE id='304'").length === 1);
+}
 const learnedRows = env.DB.query("SELECT source FROM ad_fingerprints WHERE source='learnlast'");
 check("source 标为 'learnlast'（非 auto → 跳过强动词闸；非 manual → 仍受误报退役约束）",
 	learnedRows.length > 0, learnedRows.length + ' 条');

@@ -4633,10 +4633,12 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	assert('主人 /help → 全部 8 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
 	// 旧版自动广告治理命令：这批必须从 /help 索引里彻底消失，不能只是不可用还在宣传。
 	// V2 广告检测方案重新提供了 /addword、/delword、/clearsamples 三个命令并挂进 /help，
-	// 故这三个从本清单移出；其余七个仍未恢复，必须保持不出现。
+	// 故这三个从本清单移出；其余仍未恢复的必须保持不出现。
+	// 【2026-09-12】/recent 与 /learnlast 也已重新实现（捞回被别的 bot 删掉的广告来学习）
+	// 并挂进 /help，同样从清单移出。/learn（直接粘贴文本学习）仍未恢复，继续钉死。
 	const purgedHelpCommands = [
 		'/importdefault', '/listwords',
-		'/learn', '/learnlast', '/recent',
+		'/learn ',
 		'/listsamples', '/delsample',
 	];
 	const stillAdvertised = purgedHelpCommands.filter((command) => dm?.body?.text?.includes(command));
