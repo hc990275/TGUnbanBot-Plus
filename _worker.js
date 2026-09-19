@@ -736,7 +736,8 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 而 cacheModerationMessage 的 INSERT 已经带上了新列 → 每条群消息都写失败，
 // 消息缓存整体停写、/spam 的历史清扫连带失效（线上实际发生过）。
 // 后来者新增列时务必同步 +1。
-const D1_SCHEMA_VERSION = 7;
+// 【8】2026-09-12：新增 ad_learn_snapshots（/recent 冻结快照，供 /learnlast 按序号学习）。
+const D1_SCHEMA_VERSION = 8;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
@@ -5344,6 +5345,143 @@ async function enforceLinkedSpamTargets(env, targets, options = {}) {
 	return done;
 }
 
+// ===== /recent + /learnlast：从消息缓存里捞回【已被删掉】的广告来学习（2026-09-12）=====
+//
+// 【解决什么】广告被别的 bot（GKY / 巡察管理）或管理员抢先删掉后，就没法引用回复 /spam 了，
+// 那条广告的特征永久漏学。Telegram Bot API 【不推送删除事件、也读不回已删消息】——
+// 唯一可行的路子是「消息到达时就存下正文」，之后无论被谁删，D1 里那份还在。
+// 本项目的 cacheModerationMessage 已经在存 text_norm（取消长度门槛后覆盖全部消息），
+// 语料早就躺在库里，缺的只是把它捞出来给主人挑的入口。这两条命令补上这一环。
+//
+// 【为什么分两步】/recent 拉列表 + 冻结快照，/learnlast 按序号学。
+// 序号必须来自冻结快照而不是实时查询：moderation_messages 被每条群消息持续写入并按容量剪枝，
+// 若 /learnlast 重查一次实时数据，期间进来的新消息会把列表整体挤动，
+// 主人看到的「3 号」和实际学到的就不是同一条了。旧代码专门治过这个坑。
+const RECENT_LEARN_MAX_ITEMS = 50;
+const RECENT_LEARN_LOOKBACK_MS = 48 * 60 * 60 * 1000;
+
+// 给候选打分排序：命中过特征的排前面，纯闲聊沉底。
+// 【刻意不做预筛】旧代码用 looksLikeAdCandidate 只缓存疑似广告，代价是新形态广告
+// 压根不进缓存、事后也捞不回来。这里全部保留、只排序 —— 既不漏新形态，
+// 主人又不必翻 50 条才看到第一条广告。
+async function scoreRecentLearnCandidate(env, item, fingerprints, whitelistSet) {
+	const text = String(item.text || '');
+	if (!text) return { weight: 0, hints: [] };
+	const hints = [];
+	let weight = 0;
+	try {
+		const scored = scoreAdMessageText(text, { whitelist: whitelistSet });
+		if (Number(scored?.score) > 0) {
+			weight += Number(scored.score);
+			hints.push('结构分 ' + scored.score);
+		}
+	} catch (_) { /* 单条打分失败不影响列表 */ }
+	if (hasAdCharSplitObfuscation(text)) {
+		weight += 4;
+		hints.push('逐字分隔混淆');
+	}
+	try {
+		const hit = matchAdFingerprints(fingerprints, { text }, {});
+		if (hit?.hits?.length) {
+			weight += 5;
+			hints.push('指纹命中 ' + hit.hits.length + ' 条');
+		}
+	} catch (_) { /* 指纹比对失败不影响列表 */ }
+	return { weight, hints };
+}
+
+// 拉取最近缓存的群消息作为学习候选。群内发=只看当前群，私聊发=看全部配置群。
+async function loadRecentLearnCandidates(env, sourceChatId, limit) {
+	if (!env?.DB) return [];
+	const sinceIso = new Date(Date.now() - RECENT_LEARN_LOOKBACK_MS).toISOString();
+	const scopeCurrentGroup = isConfiguredGroup(sourceChatId);
+	try {
+		await ensureD1Table(env);
+		// text_norm IS NOT NULL 过滤掉无正文的消息（图片、服务消息等）。
+		// 多取一些再排序截断 —— 排序键是特征权重，不是时间，所以不能只取最新 N 条。
+		const sql = scopeCurrentGroup
+			? 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND created_at >= ? AND chat_id = ? ORDER BY id DESC LIMIT 300'
+			: 'SELECT mid, chat_id, from_id, text_norm, created_at FROM moderation_messages WHERE text_norm IS NOT NULL AND created_at >= ? ORDER BY id DESC LIMIT 300';
+		const stmt = scopeCurrentGroup
+			? env.DB.prepare(sql).bind(sinceIso, String(sourceChatId))
+			: env.DB.prepare(sql).bind(sinceIso);
+		const { results } = await stmt.all();
+		const rows = results || [];
+		if (!rows.length) return [];
+
+		const fingerprints = await loadAdFingerprints(env);
+		const whitelistSet = await loadAdDomainWhitelist(env);
+		// 同文案去重：同一段广告被 N 个号刷过时只留一条，否则 50 个名额全被同款占满。
+		// 留的是最早那条（ORDER BY id DESC 取到的最后一条），刷广告的号数另行计数展示。
+		const byText = new Map();
+		for (const row of rows) {
+			const norm = String(row.text_norm || '');
+			if (!norm) continue;
+			if (!byText.has(norm)) {
+				byText.set(norm, {
+					text: norm,
+					mid: Number(row.mid) || 0,
+					chatId: String(row.chat_id || ''),
+					fromId: String(row.from_id || ''),
+					senders: new Set([String(row.from_id || '')]),
+					createdAt: String(row.created_at || '')
+				});
+			} else {
+				byText.get(norm).senders.add(String(row.from_id || ''));
+			}
+		}
+		const items = [];
+		for (const entry of byText.values()) {
+			const scored = await scoreRecentLearnCandidate(env, entry, fingerprints, whitelistSet);
+			items.push({
+				text: entry.text,
+				mid: entry.mid,
+				chatId: entry.chatId,
+				fromId: entry.fromId,
+				senderCount: entry.senders.size,
+				createdAt: entry.createdAt,
+				weight: scored.weight,
+				hints: scored.hints
+			});
+		}
+		// 先按特征权重降序，同权重按「刷的号数」降序 —— 多号刷同一段文案本身就是广告信号。
+		items.sort((a, b) => (b.weight - a.weight) || (b.senderCount - a.senderCount));
+		return items.slice(0, Math.max(1, Math.min(RECENT_LEARN_MAX_ITEMS, Number(limit) || RECENT_LEARN_MAX_ITEMS)));
+	} catch (error) {
+		console.error('[学习候选] 读取失败:', error);
+		return [];
+	}
+}
+
+async function saveLearnSnapshot(env, ownerId, items, scope) {
+	if (!env?.DB) return false;
+	try {
+		await ensureD1Table(env);
+		await env.DB.prepare(
+			'INSERT INTO ad_learn_snapshots (owner_id, items, scope, created_at) VALUES (?, ?, ?, ?) '
+			+ 'ON CONFLICT(owner_id) DO UPDATE SET items = excluded.items, scope = excluded.scope, created_at = excluded.created_at'
+		).bind(String(ownerId), JSON.stringify(items).slice(0, 90000), String(scope || ''), Math.floor(Date.now() / 1000)).run();
+		return true;
+	} catch (error) {
+		console.error('[学习快照] 写入失败:', error);
+		return false;
+	}
+}
+
+async function loadLearnSnapshot(env, ownerId) {
+	if (!env?.DB) return null;
+	try {
+		await ensureD1Table(env);
+		const row = await env.DB.prepare('SELECT items, scope, created_at FROM ad_learn_snapshots WHERE owner_id = ?')
+			.bind(String(ownerId)).first();
+		if (!row?.items) return null;
+		return { items: JSON.parse(row.items), scope: row.scope || '', createdAt: Number(row.created_at) || 0 };
+	} catch (error) {
+		console.error('[学习快照] 读取失败:', error);
+		return null;
+	}
+}
+
 // 连带结果私聊第一主人。核心是【一键回滚】：把连带到的全部 TGID 拼成一条可直接复制的
 // /unban 命令 —— 连带把单次误判乘以 N 倍，回滚入口必须现成，不能让主人回头一个个抄 ID。
 async function notifyLinkedSpamResult(env, info) {
@@ -6827,6 +6965,32 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	//      早退只保留零成本的确定性排除：slash 命令、无正文且无转发、管理员。
 	//      不再按正文分做预筛 —— 那个省法漏放了资料分 10 分的明显广告号，详见 detectAdOnMessage。
 	// 三者都只在自己确实处理了这条消息时返回 true；否则一律返回 false 继续原流程。
+	// /recent 单独挂在这里而不进 handleAdDetectionCommands：那个函数对群内命令一律
+	// 撤回 + 引导私聊，而 /recent 的主用法恰恰是【在群里】发 —— 看到广告被别的 bot 删掉，
+	// 顺手拉一份候选列表。命令消息仍会被撤回、列表只走私聊，群内不留痕迹。
+	if (typeof message?.text === 'string' && /^\/recent(?:@[^\s]+)?(?:\s|$)/i.test(message.text.trim())) {
+		const recentIsInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(getMessageActorId(message))) {
+			// 群内静默（不暴露命令存在）；私聊明确告知。与其它管理命令同一口径。
+			if (!recentIsInGroup) {
+				await sendTelegramMessage(message.chat.id, '❌ <b>权限不足</b>\n\n学习候选命令仅限第一主人使用。');
+			}
+			return;
+		}
+		if (recentIsInGroup) await deleteAuthorizedGroupCommandMessage(message, '/recent');
+		if (!env.DB) {
+			await sendTelegramMessage(getMessageActorId(message), '❌ 未绑定 D1 存储空间，学习候选不可用。');
+			return;
+		}
+		try {
+			await handleAdRecentCommand(message, env, ctx);
+		} catch (error) {
+			console.error('[学习候选] /recent 执行异常:', error);
+			await sendTelegramMessage(getMessageActorId(message), '❌ 命令执行异常：' + escapeHtml(String(error?.message || error)));
+		}
+		return;
+	}
+
 	if (await handleAdDetectionCommands(message, env, ctx)) {
 		return;
 	}
@@ -9725,7 +9889,8 @@ async function d1AdDetectionTablesExist(env) {
 		'ad_pending_snapshots',
 		'ad_confirm_tokens',
 		'ad_group_members',
-		'ad_scan_state'
+		'ad_scan_state',
+		'ad_learn_snapshots'
 	]);
 }
 
@@ -9783,6 +9948,12 @@ async function ensureAdDetectionTables(env) {
 			// 【没有游标列】—— 扫描顺序由 bio_checked_at ASC 决定，查过就把时间戳推到现在，
 			// 于是它自动排到队尾。这是自平衡的，不需要显式游标，也不会因为增删行而错位。
 			await runD1SchemaStatement(env, 'ad_scan_state', 'CREATE TABLE IF NOT EXISTS ad_scan_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL)');
+			// /recent 冻结快照：供 /learnlast 按固定序号引用，根治序号漂移。
+			// 【为什么必须冻结】/recent 展示的是 moderation_messages 的实时切片，
+			// 而那张表被每条群消息持续写入并按容量剪枝。若 /learnlast 再查一次实时数据，
+			// 期间进来的新消息会把列表整体挤动 —— 主人看到的「3 号」和实际学到的不是同一条。
+			// 旧代码专门治过这个坑，此处照搬：/recent 写快照，/learnlast 只读快照。
+			await runD1SchemaStatement(env, 'ad_learn_snapshots', 'CREATE TABLE IF NOT EXISTS ad_learn_snapshots (owner_id TEXT PRIMARY KEY, items TEXT NOT NULL, scope TEXT, created_at INTEGER NOT NULL)');
 
 			if (!(await d1AdDetectionTablesExist(env))) throw new Error('D1 广告检测表迁移不完整');
 			await seedAdDetectionData(env);
@@ -13465,7 +13636,10 @@ async function detectAdOnMessage(message, env) {
 // 10 条广告检测命令一律走这一个入口，handleMessage 里只挂一个钩子，
 // 不改动任何既有命令分支。返回 true 表示命令已被处理，调用方应立即 return。
 // 【2026-09-08 从 11 条减为 10 条】confirm 已删除，见 handleAdIgnoreCommand 上方的说明。
-const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
+// /learnlast 放进这里是因为它与本组命令的约束完全一致：仅第一主人、强制私聊。
+// /recent 【刻意不在】这里 —— 它必须群内可用（在群里看到广告被删就顺手拉列表），
+// 而本函数对群内命令一律撤回 + 引导私聊，会把 /recent 的主用法直接堵死。
+const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|rescreen|warmup|learnlast)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
 function adPayloadFromSnapshot(snapshot) {
@@ -13531,12 +13705,116 @@ async function handleAdDetectionCommands(message, env, ctx) {
 			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
 			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
 			case 'warmup': await handleAdWarmupCommand(env, chatId); break;
+			case 'learnlast': await handleAdLearnLastCommand(env, chatId, ownerId, arg); break;
 		}
 	} catch (error) {
 		console.error('[广告检测] 命令 /' + command + ' 执行异常:', error);
 		await sendTelegramMessage(chatId, '❌ 命令执行异常：' + escapeHtml(String(error?.message || error)));
 	}
 	return true;
+}
+
+// /recent [N]：拉取最近缓存的群消息作为学习候选，冻结成快照后把带序号列表推私聊。
+// 群内可用（这是主用法：在群里看到广告被别的 bot 删掉，顺手拉一份），
+// 但列表只走私聊 —— 候选里含 TGID 与广告原文，不该公开在群里。
+async function handleAdRecentCommand(message, env, ctx) {
+	const chatId = message.chat.id;
+	const ownerId = String(getMessageActorId(message));
+	const isInGroup = message.chat.type !== 'private';
+	const arg = String(message.text || '').replace(/^\/recent(?:@[^\s]+)?\s*/i, '').trim();
+	const limit = /^\d+$/.test(arg) ? parseInt(arg, 10) : RECENT_LEARN_MAX_ITEMS;
+
+	const items = await loadRecentLearnCandidates(env, isInGroup ? chatId : '', limit);
+	const scopeLabel = isInGroup ? (message.chat.title || '本群') : '全部配置群';
+	if (!items.length) {
+		const emptyText = 'ℹ️ 最近 48 小时内没有可学习的缓存消息（范围：' + escapeHtml(scopeLabel) + '）。';
+		await replyToAdmin(message, ctx, {
+			flashText: 'ℹ️ 暂无学习候选，详情已私聊',
+			detailText: emptyText,
+			isInGroup
+		});
+		return;
+	}
+	await saveLearnSnapshot(env, ownerId, items, scopeLabel);
+
+	const lines = [
+		'📋 <b>学习候选快照</b>（' + escapeHtml(scopeLabel) + ' · ' + items.length + ' 条 · 已冻结）',
+		'按广告特征强度排序，命中特征的在前。',
+		''
+	];
+	items.forEach((it, i) => {
+		lines.push((i + 1) + '. <code>' + escapeHtml(String(it.text).slice(0, 60)) + '</code>');
+		const meta = [];
+		if (it.hints.length) meta.push(it.hints.join(' / '));
+		if (it.senderCount > 1) meta.push(it.senderCount + ' 个号发过');
+		meta.push('TGID <code>' + escapeHtml(it.fromId) + '</code>');
+		lines.push('   — ' + meta.join('　'));
+	});
+	lines.push('');
+	lines.push('✅ <b>请私聊我</b>核对后学习（群内不能学）：');
+	lines.push('学一条：<code>/learnlast 3</code>　学多条：<code>/learnlast 1,3,5</code>');
+	lines.push('⚠️ 学习只入指纹库与 AI 样本库，<b>不封禁任何人</b>；要封发广告的号请复制上面 TGID 用 <code>/ban</code> 或 <code>/spam</code>。');
+
+	await replyToAdmin(message, ctx, {
+		flashText: '📋 ' + items.length + ' 条学习候选已推送私聊',
+		detailText: lines.join('\n'),
+		isInGroup
+	});
+}
+
+// /learnlast 序号[,序号...]：按 /recent 冻结的快照序号学习。仅私聊（由 AD_COMMAND_RE 分支保证）。
+// 【只入库不封禁】学习与处置刻意分开：主人核对的是「这段文案是不是广告」，
+// 而封谁是另一个决定 —— 合在一起的话点错序号就会连带封错人。
+async function handleAdLearnLastCommand(env, chatId, ownerId, arg) {
+	const snap = await loadLearnSnapshot(env, ownerId);
+	const list = snap?.items || [];
+	if (!list.length) {
+		await sendTelegramMessage(chatId, 'ℹ️ 没有可用的快照。\n请先发 <code>/recent</code> 拉取学习候选列表，再回来用 <code>/learnlast 序号</code>。');
+		return;
+	}
+	const indices = [...new Set(
+		String(arg || '').split(/[,，\s]+/)
+			.map((s) => parseInt(s, 10))
+			.filter((n) => Number.isInteger(n) && n >= 1 && n <= list.length)
+	)];
+	if (!indices.length) {
+		await sendTelegramMessage(chatId, [
+			'❌ 请给出有效序号（快照共 <b>' + list.length + '</b> 条）。',
+			'例：<code>/learnlast 3</code>　或　<code>/learnlast 1,3,5</code>'
+		].join('\n'));
+		return;
+	}
+
+	const lines = ['📖 <b>已学习 ' + indices.length + ' 条</b>（序号 ' + indices.join(',') + '）', ''];
+	let learnedTotal = 0;
+	let sampleTotal = 0;
+	for (const idx of indices) {
+		const it = list[idx - 1];
+		if (!it) continue;
+		const text = String(it.text || '');
+		// source 用 'learnlast'：不是 'auto' → 自动跳过 learnAdFingerprints 的强动词闸门
+		//（人工判定不需要那道防自动学习的闸）；又不是 'manual' → 仍受误报退役机制约束，
+		// 万一学错了，/ignore 累计误报后能自动清掉，不会留成永久误封源。
+		const learn = await learnAdFingerprints(env, { name: '', username: '', bio: '', text }, {
+			source: 'learnlast',
+			createdBy: ownerId
+		});
+		const learned = Number(learn?.learned || 0);
+		learnedTotal += learned;
+		let sampleAdded = 0;
+		const sampleText = buildAdSampleText({ name: '', bio: '', text });
+		if (sampleText.length >= 4) {
+			const s = await addAdSample(env, sampleText, { source: 'learnlast' });
+			if (s?.added) { sampleAdded = 1; sampleTotal += 1; }
+		}
+		lines.push(idx + '. <code>' + escapeHtml(text.slice(0, 60)) + '</code>');
+		lines.push('   指纹 +' + learned + '　AI 样本 +' + sampleAdded
+			+ (it.senderCount > 1 ? '　（' + it.senderCount + ' 个号发过）' : ''));
+	}
+	lines.push('');
+	lines.push('合计：指纹 <b>+' + learnedTotal + '</b>　AI 样本 <b>+' + sampleTotal + '</b>');
+	lines.push('ℹ️ 学习只入库，<b>未封禁任何人</b>。要封号请用 <code>/ban TGID</code> 或引用回复 <code>/spam</code>。');
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
 
 // /pending [数量]：列出待确认的判定快照，1 小时后自动过期。

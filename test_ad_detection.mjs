@@ -1578,9 +1578,11 @@ section('[11] 回归：既有功能不被广告层吞掉');
 	// 写死数字而非引用常量：_worker.js 里 D1_SCHEMA_VERSION 是 const，不挂 vm 沙箱全局，
 	// 取出来是 undefined。写死的好处是「改了常量必须回来改这里」，
 	// 迫使后来者正面确认一次迁移影响，而不是让断言跟着常量静默滑过去。
-	assert('核心表 schema 版本为 7（moderation_messages 新增 text_hash/text_norm）',
-		Number(env.DB.query('SELECT version FROM schema_meta WHERE id = 1')[0]?.version) === 7,
+	assert('核心表 schema 版本为 8（新增 ad_learn_snapshots）',
+		Number(env.DB.query('SELECT version FROM schema_meta WHERE id = 1')[0]?.version) === 8,
 		JSON.stringify(env.DB.query('SELECT * FROM schema_meta')));
+	assert('ad_learn_snapshots 表已建（/recent 冻结快照）',
+		env.DB.query("SELECT name FROM sqlite_master WHERE type='table' AND name='ad_learn_snapshots'").length === 1);
 	// 新列必须真的存在 —— 版本号写对但列没加上，正是线上那次故障的形态。
 	{
 		const modCols = env.DB.query('PRAGMA table_info(moderation_messages)').map((c) => c.name);
