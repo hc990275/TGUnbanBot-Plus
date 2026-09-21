@@ -231,6 +231,7 @@ function applyRuntimeConfig(config) {
 	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
 	PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
 	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
+	AD_TRUSTED_BOTS = config.AD_TRUSTED_BOTS || [];
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
 	FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
 	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
@@ -518,6 +519,7 @@ function loadRequiredConfig(env) {
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
 		GKY_BANLIST_ENDPOINT: gkyEndpoint,
 		STATIC_USER_PROFILES: parseStaticUserProfiles(env.STATIC_USER_PROFILES),
+		AD_TRUSTED_BOTS: parseAdTrustedBots(env.AD_TRUSTED_BOTS),
 		// 只读资料群：与 GROUP_ID 同样的逗号分隔格式，但【绝不并入 uniqueGroupIds】。
 		// 已在 GROUP_ID 里的群自动剔除 —— 那些群本来就会被遍历，重复只是白花请求。
 		PROFILE_LOOKUP_GROUPS: parseProfileLookupGroups(env.PROFILE_LOOKUP_GROUPS, uniqueGroupIds),
@@ -1768,6 +1770,43 @@ const ANON_ADMIN_BOT_ID = '1087968824';
 // 任何作为管理员的第三方机器人都算机器人操作；GroupAnonymousBot（真人匿名身份）视为真人，不算。
 function isBotOperator(user) {
 	return Boolean(user?.is_bot) && String(user?.id || '') !== ANON_ADMIN_BOT_ID;
+}
+
+// ===== 广告检测可信 bot 白名单（2026-09-21）=====
+// 背景：广告号在群里艾特若干 @xxxbot 后【自行删除原消息】，那些 bot 并不在群里，
+// 而是由一个常驻的 bot 账号把广告正文带引用重新发出来 —— 引用的还是主人自己发的
+// /ban / /spam 命令消息，于是形成「主人处置一次，广告被重发一次」的循环。
+// 根因是 detectAdOnMessage 与黑名单发言拦截都用 from.is_bot 直接跳过，
+// bot 发的一切消息完全免检，重发的广告一条都不会被处理。
+//
+// 放宽后必须留白名单：协作治理 bot（nmBot / GKY）的回执会【原样引用广告文本】，
+// 不豁免就会被删甚至被封，直接影响群治理。
+// 按 username 匹配而非 TGID：bot 的 TGID 不易获取，而 username 稳定且主人能直接看到。
+const DEFAULT_AD_TRUSTED_BOTS = ['nmnmfunbot', 'tc520lh_bot'];
+let AD_TRUSTED_BOTS = [];
+
+// 解析可信 bot 白名单：逗号分隔（半角 / 全角均可），@ 前缀可省，大小写不敏感。
+function parseAdTrustedBots(raw) {
+	const source = raw == null || String(raw).trim() === ''
+		? DEFAULT_AD_TRUSTED_BOTS
+		: String(raw).split(/[,，\s]+/);
+	const list = (Array.isArray(source) ? source : [source])
+		.map((v) => String(v || '').trim().replace(/^@+/, '').toLowerCase())
+		.filter((v) => /^[a-z0-9_]{4,32}$/.test(v));
+	return [...new Set(list)];
+}
+
+// 这个 bot 是否豁免广告检测。三类一律豁免，缺一会自伤：
+//   1) 自己 —— 否则 bot 的回执（含广告原文的判定详情）会被自己判成广告；
+//   2) GroupAnonymousBot —— 那是真人以匿名管理员身份发言，本就不该按 bot 处置；
+//   3) 白名单协作 bot —— 它们的回执原样引用广告文本，误删会破坏群治理。
+function isAdExemptBot(user) {
+	if (!user?.is_bot) return false;
+	const idStr = String(user.id || '');
+	if (BOT_ID && idStr === String(BOT_ID)) return true;
+	if (idStr === ANON_ADMIN_BOT_ID) return true;
+	const uname = String(user.username || '').replace(/^@+/, '').toLowerCase();
+	return Boolean(uname) && AD_TRUSTED_BOTS.includes(uname);
 }
 
 function isAnonymousAdminMessage(message) {
@@ -5499,6 +5538,94 @@ async function loadLearnSnapshot(env, ownerId) {
 	}
 }
 
+// ===== 广告重发删除通道（2026-09-21 主人选定方案三）=====
+// 【这条通道刻意只删消息，代码上不接任何封禁/加黑调用】——
+// 主人定的规则：第一条广告号封禁（已由 detectAdOnMessage 正常工作），
+// 「接下来的引用重发全都是误封行为，不能触发封禁」。
+// 所以这里不是「先判断再决定封不封」，而是这条路径【根本没有封禁能力】，
+// 从结构上排除误封，而不是靠调用点小心翼翼地不去调。
+//
+// 判据是确定性的：这段正文【已经被处置过】，不是「像不像广告」。
+// 与上次 AI 硬命中误封（快照 #1615）的教训一致 —— 概率性判断不该独立定罪。
+//
+// 存储复用 ad_scan_state 键值表，不新建表：单键存一份「最近已处置文案指纹」环形列表，
+// JSON 数组，只留最近 N 条，够覆盖 24 小时内的重发即可。
+const AD_HANDLED_TEXTS_KEY = 'ad_handled_texts';
+const AD_HANDLED_TEXTS_MAX = 60;
+const AD_HANDLED_TEXTS_TTL_MS = 24 * 60 * 60 * 1000;
+// 运行期缓存（按 DB 实例，惯例同 AD_FINGERPRINT_CACHE）。这张表只在封禁成功时才写，
+// 平时是纯读热路径，缓存 15 秒不会漏掉真实重发（重发间隔是人工处置的分钟级）。
+const AD_HANDLED_TEXTS_CACHE = new WeakMap();
+const AD_HANDLED_TEXTS_CACHE_TTL_MS = 15 * 1000;
+
+// 只读一次并解析成数组。写入端会主动刷新这份缓存，所以不存在「刚封完就漏删」的窗口。
+async function loadHandledAdTexts(env) {
+	return await loadAdCachedValue(AD_HANDLED_TEXTS_CACHE, env?.DB, AD_HANDLED_TEXTS_CACHE_TTL_MS, async () => {
+		const raw = await readAdScanState(env, AD_HANDLED_TEXTS_KEY, '[]');
+		try {
+			const parsed = JSON.parse(raw);
+			return Array.isArray(parsed) ? parsed : [];
+		} catch (_) {
+			return [];
+		}
+	});
+}
+
+function primeHandledAdTexts(env, list) {
+	if (!env?.DB) return;
+	AD_HANDLED_TEXTS_CACHE.set(env.DB, {
+		value: Array.isArray(list) ? list : [],
+		expiresAt: Date.now() + AD_HANDLED_TEXTS_CACHE_TTL_MS,
+		promise: null,
+	});
+}
+
+// 记录一条「已被处置的广告文案」。由 enforceAdDetection 在封禁成功后调用。
+async function recordHandledAdText(env, rawText) {
+	const norm = normalizeAdFingerprintValue(rawText);
+	// 过短的不记：那种文案撞正常发言概率高，而这条通道是【无条件删消息】，宁缺毋滥。
+	if (norm.length < 6) return;
+	try {
+		const now = Date.now();
+		const list = await loadHandledAdTexts(env);
+		// 去重 + 淘汰过期，再按上限截断（最新在前）。
+		const kept = (Array.isArray(list) ? list : [])
+			.filter((x) => x && typeof x.t === 'string' && Number(x.at) > 0)
+			.filter((x) => now - Number(x.at) < AD_HANDLED_TEXTS_TTL_MS)
+			.filter((x) => x.t !== norm);
+		kept.unshift({ t: norm, at: now });
+		const next = kept.slice(0, AD_HANDLED_TEXTS_MAX);
+		await writeAdScanState(env, AD_HANDLED_TEXTS_KEY, JSON.stringify(next));
+		// 写完立刻把缓存顶成新值：重发往往在封禁后几秒内到达，
+		// 若等 TTL 自然过期就会漏删第一条重发。
+		primeHandledAdTexts(env, next);
+	} catch (error) {
+		// 记录失败只影响「后续重发能否被删」，不影响本次封禁 —— 那边已经完成。
+		console.error('[重发删除] 记录已处置文案失败:', error);
+	}
+}
+
+// 这条消息是否在重发已处置的广告。比对自身正文与引用体正文两处：
+// 重发形态正是「引用主人的命令消息 + 自己贴广告正文」，所以两边都要看。
+async function matchHandledAdText(env, message) {
+	if (!env?.DB) return false;
+	const candidates = [
+		String(message?.text ?? message?.caption ?? ''),
+		String(message?.reply_to_message?.text ?? message?.reply_to_message?.caption ?? '')
+	].map((t) => normalizeAdFingerprintValue(t)).filter((t) => t.length >= 6);
+	if (!candidates.length) return false;
+	try {
+		const list = await loadHandledAdTexts(env);
+		if (!Array.isArray(list) || !list.length) return false;
+		const now = Date.now();
+		const fresh = list.filter((x) => x && typeof x.t === 'string' && now - Number(x.at) < AD_HANDLED_TEXTS_TTL_MS);
+		return fresh.some((x) => candidates.includes(x.t));
+	} catch (error) {
+		console.error('[重发删除] 比对已处置文案失败:', error);
+		return false;
+	}
+}
+
 // 连带结果私聊第一主人。核心是【一键回滚】：把连带到的全部 TGID 拼成一条可直接复制的
 // /unban 命令 —— 连带把单次误判乘以 N 倍，回滚入口必须现成，不能让主人回头一个个抄 ID。
 async function notifyLinkedSpamResult(env, info) {
@@ -7013,6 +7140,31 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	if (await handleAdReplyLearning(message, env, ctx)) {
+		return;
+	}
+
+	// ===== 广告重发删除通道（2026-09-21 主人选定方案三）=====
+	// 【必须排在 detectAdOnMessage 之前】否则重发者会先被广告检测封掉 ——
+	// 而主人定的规则是「第一条广告号封禁，接下来的引用重发全是误封行为、不能触发封禁」。
+	// 这里只删消息就 return，那条广告正文不留在群里，重发者一根头发都不动。
+	//
+	// 不看发送者是 bot 还是真人：bot 重发、真人原文转述警示他人，都只删消息。
+	// 判据是「这段正文已经被处置过」这个确定性事实，不是「像不像广告」。
+	//
+	// 【前置条件刻意收紧到「bot 发的」或「带引用体」】两个原因：
+	//   1) 重发形态必然满足其中之一 —— bot 账号发出、且带引用（引用主人的命令消息）。
+	//   2) 真人不带引用、直接重打一遍广告正文，那本来就该走 detectAdOnMessage 正常封禁，
+	//      走这条只删不封的通道反倒是放过。
+	// 副作用是热路径省掉一次 D1 读：真人普通发言不满足前置条件，压根不查表。
+	if (
+		isConfiguredGroup(chatId) && message.message_id
+		&& !isTelegramServiceMessage(message)
+		&& !isAdExemptBot(message.from)
+		&& (message.from?.is_bot === true || message.reply_to_message)
+		&& await matchHandledAdText(env, message)
+	) {
+		console.log('[重发删除] 群 ' + chatId + ' 消息 ' + message.message_id + ' 重发已处置广告，仅删消息不封禁');
+		await deleteMessage(chatId, message.message_id);
 		return;
 	}
 
@@ -13201,6 +13353,13 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	} catch (error) {
 		console.error('[广告检测] 全群封禁失败:', error);
 	}
+
+	// 记下这次处置的广告文案，供【重发删除通道】比对。
+	// 记的是判定载荷里的正文（evaluation.payload.text），不是昵称或简介 ——
+	// 重发者贴的正是这段正文，而昵称/简介是它自己的，对不上。
+	try {
+		await recordHandledAdText(env, evaluation?.payload?.text || evaluation?.snapshot?.text || '');
+	} catch (_) { /* 记录失败不影响本次处置 */ }
 	const okCount = banResults.filter((r) => r.ok).length;
 	const failedBans = banResults.filter((r) => !r.ok);
 	let banSummary = okCount + '/' + banResults.length + ' 个群成功';
@@ -13436,7 +13595,16 @@ async function detectAdOnMessage(message, env) {
 	if (!env?.DB) return false;
 	const chat = message?.chat;
 	const from = message?.from;
-	if (!chat || !from || from.is_bot) return false;
+	if (!chat || !from) return false;
+	// 【2026-09-21 bot 消息不再整体免检】原来这里是 `from.is_bot` 直接 return false，
+	// 于是【任何 bot 发的消息都不进广告检测】。线上被这样利用：
+	// 广告号艾特若干 @xxxbot 后自行删除原消息，那些 bot 并不在群里，
+	// 而是由一个常驻 bot 账号把广告正文带引用重新发出来（引用的还是主人自己的
+	// /ban / /spam 命令消息）—— 主人处置一次，广告就被重发一次，且重发的那条一律免检。
+	// 现在只豁免三类（自己 / 匿名管理员 / 白名单协作 bot），其余 bot 走完整检测。
+	// 换 handle 无效：判据是 analyzeAdOutlets 的「多个 bot 结尾 handle 同现」等结构特征，
+	// 不依赖任何具体 handle 名单（快照 #1961 正是靠「引流出口×3(含bot)」命中的）。
+	if (isAdExemptBot(from)) return false;
 	if (!isConfiguredGroup(chat.id)) return false;
 
 	// 临时诊断开关：环境变量 AD_DEBUG_DUMP_UPDATE=1 时，把本群每条消息的 update 原文打进日志。
