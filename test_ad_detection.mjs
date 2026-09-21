@@ -601,6 +601,46 @@ section('[5] AI 语义层三分支（硬命中 / 软加分 / 未绑定降级）'
 	assert('AI 硬命中：判定依据写明相似度', hard.reasons.some((r) => r.includes('AI 语义相似度')), JSON.stringify(hard.reasons));
 	assert('AI 硬命中：回带命中样本原文', typeof hard.aiSample === 'string' && hard.aiSample.length > 0, String(hard.aiSample));
 	assert('AI 硬命中：得分低于阈值也照样定罪（hardHit 优先）', hard.score < 7, String(hard.score));
+	assert('AI 硬命中：得分 0 分时仍定罪（豁免词未判负，召回不受影响）', hard.score >= 0, String(hard.score));
+
+	// ===== 豁免词否证优先于 AI 硬命中（线上误封 #1615 回归）=====
+	// 线上原样复现：正常用户简介「我的频道 https://t.me/lchnnb 私聊机器人 @wanfengr666_bot」、
+	// 正文只发「签到」。豁免词正确扣了 6 分（机器人/bot/私聊 -3、签到 -3）→ 得分 -4，
+	// 却因 AI 相似度 0.789 越过阈值 0.78（仅超 0.009）被硬命中定罪，封了 13 个群。
+	//
+	// 两类证据性质不同：豁免词是【确定性证据】（正文确实含「签到」），
+	// AI 相似度是【概率性判断】（0.789 与 0.78 的差在噪声范围内）。
+	// 确定性证据已明确否证时，不该让概率性判断单独推翻。
+	// 【刻意不调阈值】那是按样本调数字 —— 连带门槛上已吃过三次教训（12→4→取消）。
+	{
+		const victim = {
+			profile: {
+				firstName: '逝去的晚风',
+				username: 'aefg56',
+				bio: '我的频道 https://t.me/lchnnb 私聊机器人 @wanfengr666_bot',
+				status: 'member'
+			},
+			text: '签到',
+			forwardChat: null
+		};
+		// 【恒返回广告向量】线上那次相似度 0.789 是真实 embedding 算出来的，
+		// 伪 AI 按关键词映射时这个样本命不中，走不到降级分支 —— 那样这条改动等于没测。
+		// 这里强制让任何文本都拿到广告向量（余弦 = 1.0），把硬命中条件钉死为真，
+		// 于是唯一能阻止定罪的就只有新加的豁免词否证。
+		// 复用 adVector 的「广告」分支向量（base[0]=1, base[1]=0.5），但无条件返回 ——
+		// 样本库里的种子也是这个向量，于是余弦恒为 1.0，硬命中条件必然成立。
+		const alwaysAdVector = () => adVector('收购网赚');
+		const envVictim = makeEnv({ AI: makeFakeAI(alwaysAdVector) });
+		await W.adDetectionReady(envVictim);
+		const r = await W.evaluateAdSuspect(envVictim, victim, {});
+		assert('误封 #1615：豁免词已判负（得分 < 0）', r.score < 0, '得分 ' + r.score + ' / ' + JSON.stringify(r.reasons));
+		assert('误封 #1615：AI 硬命中被豁免词否证，不再定罪', r.verdict !== 'ban', 'verdict=' + r.verdict + ' ' + JSON.stringify(r.reasons));
+		assert('误封 #1615：判定层不再标记为 ai', r.layer !== 'ai', 'layer=' + r.layer);
+		assert('误封 #1615：相似度确实越过了阈值（证明硬命中条件成立过）',
+			r.aiSimilarity >= 0.78, '相似度 ' + r.aiSimilarity);
+		assert('误封 #1615：reasons 写明降级原因（便于复盘）',
+			r.reasons.some((x) => x.includes('豁免词已判负') && x.includes('降级')), JSON.stringify(r.reasons));
+	}
 	assert('样本向量已被懒加载写入 D1', envAi.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL')[0].c >= 8);
 
 	// 软加分：探针向量 [1, 0.2, 0.8] 与广告向量 [1, 0.5] 的余弦 ≈ 0.759，落在 [0.65, 0.78)。

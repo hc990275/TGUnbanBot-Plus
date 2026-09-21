@@ -12993,6 +12993,10 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		&& fingerprint.nonSingleMaxWeight >= AD_FINGERPRINT_BAN_WEIGHT;
 
 	let ai = { available: false, similarity: 0, sample: null, isMatch: false, isSoft: false };
+	// AI 硬命中是否被豁免词否证。声明在这里而不是 if 块内：下面的 hardHit 汇总点
+	// （真正决定 verdict 与 layer 的地方）必须读到它 —— 只在 if 块里判断等于没改，
+	// 那里照样会用裸 ai.isMatch 定罪（离线实测踩到过：reasons 写了降级、verdict 仍是 ban）。
+	let aiExemptVeto = false;
 	// 【检测端与学习端共用同一个拼装函数】原来这里手写 join，与 buildAdSampleText 拼法碰巧一致
 	// 靠的是两处各自维护 —— 一改就会分叉。2026-09-09 加链接归一化时正式收敛到一处：
 	// payload 的 name / bio / text 与 buildAdSampleText 取的三个字段完全对应，
@@ -13001,9 +13005,30 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	const semanticText = buildAdSampleText(payload);
 	if (config.aiEnabled && semanticText.length >= 6) {
 		ai = await checkAdAiSimilarity(env, semanticText, { config });
-		if (ai.isMatch) {
+		// ===== 豁免词否证优先于 AI 硬命中（2026-09-12 线上误封 #1615）=====
+		// 线上误封：正常用户简介写「我的频道 https://t.me/xxx 私聊机器人 @xxx_bot」、
+		// 正文只发「签到」，得分 -4（豁免词已正确扣 6 分：机器人/bot/私聊 -3、签到 -3），
+		// 却因 AI 相似度 0.789 越过阈值 0.78【仅超 0.009】被硬命中定罪，封了 13 个群。
+		//
+		// 【为什么让豁免词赢】两类证据的性质不同：
+		//   · 豁免词是【确定性证据】—— 正文确实含「签到」、简介确实含「机器人」，是事实；
+		//   · AI 相似度是【概率性判断】—— 0.789 与 0.78 的差距在噪声范围内。
+		// 确定性证据已明确否证时，不该让概率性判断单独推翻它。
+		//
+		// 【为什么不调阈值】那是按样本调数字，下次来个 0.86 的正常用户又要调一轮 ——
+		// 本项目在连带门槛上已经吃过三次这个教训（12 字 → 4 字 → 取消）。
+		// 这里改判据：负分意味着豁免词占了上风，此时 AI 硬命中降级为软加分，
+		// 让它回到「凑分」赛道而不是「秒杀」赛道。得分 ≥ 0 时 AI 硬命中照旧生效，召回不受影响。
+		aiExemptVeto = ai.isMatch && score < 0;
+		const exemptVeto = aiExemptVeto;
+		if (ai.isMatch && !exemptVeto) {
 			layer = 'ai';
 			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold);
+		} else if (exemptVeto) {
+			score += AD_AI_SOFT_BONUS_SCORE;
+			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold
+				+ '，但豁免词已判负（得分 ' + (score - AD_AI_SOFT_BONUS_SCORE) + '）→ 降级为 +'
+				+ AD_AI_SOFT_BONUS_SCORE + ' 软加分，不直接定罪');
 		} else if (ai.isSoft) {
 			score += AD_AI_SOFT_BONUS_SCORE;
 			reasons.push('+' + AD_AI_SOFT_BONUS_SCORE + ' AI 语义弱相似 ' + ai.similarity.toFixed(3));
@@ -13047,7 +13072,12 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	}
 	const structureBan = structure.guilty && config.structureKill === 'ban';
 
-	const hardHit = fingerprintBan || Boolean(ai.isMatch) || structureBan;
+	// aiHardHit：AI 硬命中，但被豁免词否证时不算 —— 详见上面 aiExemptVeto 处的注释。
+	// 【必须在这里生效，不能只改上面那个 reasons 分支】这里才是决定 verdict 与 layer 的地方；
+	// 线上误封 #1615 的样本离线实测正是这样：reasons 已写「降级为软加分」，
+	// 而 hardHit 读裸 ai.isMatch 照样定罪、layer 照样标 ai。
+	const aiHardHit = Boolean(ai.isMatch) && !aiExemptVeto;
+	const hardHit = fingerprintBan || aiHardHit || structureBan;
 	const verdict = (score >= config.scoreThreshold || hardHit)
 		? 'ban'
 		// observe 模式下的结构命中不封，但必须留观察记录 + 推快照给主人人工过目，
@@ -13058,7 +13088,9 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		verdict,
 		score,
 		layer: structureBan ? structure.channel
-			: (hardHit ? (ai.isMatch ? 'ai' : 'fingerprint')
+			// 用 aiHardHit 而非裸 ai.isMatch：被豁免词否证时这次判定并非 AI 定罪，
+			// 标成 'ai' 会让复盘时误以为是 AI 层封的。
+			: (hardHit ? (aiHardHit ? 'ai' : 'fingerprint')
 				: (structure.guilty ? structure.channel : layer)),
 		reasons,
 		threshold: config.scoreThreshold,
