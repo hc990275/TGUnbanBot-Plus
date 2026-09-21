@@ -432,16 +432,24 @@ section('[1] 结构化评分层（纯函数，零网络）');
 	assert('对称 emoji 名称重复段落检测', W.hasAdRepeatedSegment('收购账号,收购账号') === true);
 	assert('普通句子无重复段落', W.hasAdRepeatedSegment('今天天气不错，出门走走') === false);
 
-	assert('回复学习：肯定词', W.classifyAdReplyIntent('这是广告') === 'positive');
-	assert('回复学习：否定词优先于肯定词', W.classifyAdReplyIntent('不是广告') === 'negative');
-	assert('回复学习：误封也算否定', W.classifyAdReplyIntent('误封了') === 'negative');
+	// ===== 打字触发整套下线（2026-09-12 主人定的口径）=====
+	// 封禁 = /ban 或引用回复 /spam；解封 = /unban。没有第三条路。
+	// 三张触发词表全部清空，classifyAdReplyIntent 恒返回 ''。
+	// 词表怎么调都调不对是这次下线的直接原因：
+	//   · 初版收单词「广告」「垃圾」「封了」→ 管理员一句吐槽封掉 14 个群；
+	//   · 收紧为完整短语「这是广告」→ 主人自己在群里说「是广告」又触发一次。
+	// 「是广告」本就是日常讨论的陈述句，任何词表都无法区分「评论」与「要封人」。
+	assert('打字下线：曾经的肯定词不再触发', W.classifyAdReplyIntent('这是广告') === '', W.classifyAdReplyIntent('这是广告'));
+	assert('打字下线：「是广告」不再触发（本次事故的触发语）', W.classifyAdReplyIntent('是广告') === '');
+	assert('打字下线：「封了他」不再触发', W.classifyAdReplyIntent('封了他') === '');
+	assert('打字下线：「广告号」不再触发', W.classifyAdReplyIntent('广告号') === '');
+	assert('打字下线：曾经的否定词不再触发', W.classifyAdReplyIntent('不是广告') === '');
+	assert('打字下线：「误封了」不再触发', W.classifyAdReplyIntent('误封了') === '');
 	assert('回复学习：无关短句不触发', W.classifyAdReplyIntent('好的收到') === '');
-	assert('回复学习：超 20 字不触发', W.classifyAdReplyIntent('这条消息我看了半天觉得应该算是广告吧你怎么看') === '', W.classifyAdReplyIntent('这条消息我看了半天觉得应该算是广告吧你怎么看'));
 	assert('回复学习：空文本不触发', W.classifyAdReplyIntent('') === '');
-	// 默认自助解封确认句正好 20 字，不超过长度闸门，含「误封」会被判为 negative。
-	// 实际不冲突：该句是私聊自助解封流程，而回复学习要求「配置群 + 引用消息 + 管理层身份」三条同时成立。
-	assert('回复学习：默认自助解封句长度正好 20 字', '我不是广告狗，我是误封的，希望可以解封。'.length === 20);
-	assert('回复学习：自助解封句被判为 negative（仅在群内引用场景才会走到）', W.classifyAdReplyIntent('我不是广告狗，我是误封的，希望可以解封。') === 'negative');
+	// 自助解封确认句含「误封」，过去会被判 negative。清空词表后它也不再触发 ——
+	// 该句本就属于私聊自助解封流程，与群内回复学习无关。
+	assert('打字下线：自助解封句也不再触发', W.classifyAdReplyIntent('我不是广告狗，我是误封的，希望可以解封。') === '');
 
 	// slash 命令一律不进回复学习（2026-09-08 修复）。
 	// 这一组是死代码事故的直接回归点：`/spam` 四个字母自己命中 AD_REPLY_LEARN_TRIGGER_PATTERNS
@@ -455,12 +463,11 @@ section('[1] 结构化评分层（纯函数，零网络）');
 	assert('回复学习：/ban 备注含「广告」不触发', W.classifyAdReplyIntent('/ban 广告号') === '', W.classifyAdReplyIntent('/ban 广告号'));
 	assert('回复学习：/kick 备注含「封了」不触发', W.classifyAdReplyIntent('/kick 封了他') === '', W.classifyAdReplyIntent('/kick 封了他'));
 	assert('回复学习：/unban 备注含「误封」不触发', W.classifyAdReplyIntent('/unban 误封了') === '', W.classifyAdReplyIntent('/unban 误封了'));
-	// 反向钉死：说人话那条路不能被这个特例带走。斜杠必须在【开头】才算命令，
-	// 句中出现的斜杠（「广告/垃圾」这种写法）仍要正常判定。
-	assert('回复学习：说人话仍触发（特例没伤到主路径）', W.classifyAdReplyIntent('这是广告') === 'positive');
-	// 只有【开头】的斜杠才算命令；句中出现斜杠不影响判定。
-	// 触发词收紧为完整短语后，这里改用「广告号」测同一个语义（原用例的「广告」「垃圾号」已不触发）。
-	assert('回复学习：句中斜杠不算命令', W.classifyAdReplyIntent('广告号/骗子') === 'positive', W.classifyAdReplyIntent('广告号/骗子'));
+	// 【2026-09-12】这两条原本钉死「说人话仍触发」与「句中斜杠不算命令」，
+	// 都依赖非空触发词表。词表清空后打字一律不触发，两条改为验证下线彻底性：
+	// 无论有没有斜杠、斜杠在哪，结果都是空 —— isTelegramSlashCommand 那道守卫
+	// 现在没有任何实际影响，但保留它不碍事（清空是在词表层，不在守卫层）。
+	assert('打字下线：句中带斜杠同样不触发', W.classifyAdReplyIntent('广告号/骗子') === '', W.classifyAdReplyIntent('广告号/骗子'));
 	assert('回复学习：单独一个斜杠不算命令也不触发', W.classifyAdReplyIntent('/') === '', W.classifyAdReplyIntent('/'));
 }
 
@@ -1662,13 +1669,13 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 	assert('C1 admin 不触发', W.classifyAdReplyIntent('admin 已处理') === '');
 	assert('C1 ready 不触发', W.classifyAdReplyIntent('ready') === '');
 	// 真正的封禁意图仍要判为 positive。
-	assert('C1 「这是广告」仍触发', W.classifyAdReplyIntent('这是广告') === 'positive');
-	assert('C1 「封了他」触发', W.classifyAdReplyIntent('封了他') === 'positive');
-	assert('C1 「该封他」触发', W.classifyAdReplyIntent('该封他') === 'positive');
-	assert('C1 「广告号」触发', W.classifyAdReplyIntent('广告号') === 'positive');
-	assert('C1 「垃圾广告」触发', W.classifyAdReplyIntent('垃圾广告') === 'positive');
-	// 【2026-09-11 收紧为完整短语】线上事故：管理员回复一句含「广告」的吐槽，
-	// 把得分 -1（远低于阈值 7）的人封了 14 个群 —— 确认分支强制 ban 不受阈值裁决。
+	// 【2026-09-12 打字触发整套下线】这一组原本逐条钉死各短语「仍触发」，
+	// 现在全部翻转为「不再触发」。封禁只走 /ban 与引用回复 /spam，解封只走 /unban。
+	// 收紧词表治不了根：「是广告」本就是日常讨论的陈述句，主人自己在群里说了一次就触发了。
+	for (const phrase of ['这是广告', '是广告', '封了他', '该封他', '广告号', '垃圾广告', '不是广告', '误封了']) {
+		assert('C1 「' + phrase + '」不再触发打字处置', W.classifyAdReplyIntent(phrase) === '',
+			W.classifyAdReplyIntent(phrase));
+	}
 	// ===== 逐字分隔混淆（2026-09-11 方案 A）=====
 	// 样本全部取自线上纯广告群真实消息。分隔符分两级是这里的核心：
 	// 顿号/逗号是中文列举的正规标点，只在「严格逐字」时才算混淆 ——
@@ -1727,13 +1734,12 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 	// 【2026-09-10】裸 spam / spammer 不再触发：忘带 / 的误操作代价太大，/spam 斜杠命令不受影响。
 	assert('C1 英文 spam 裸词不触发', W.classifyAdReplyIntent('this is spam') === '');
 	assert('C1 spammer 裸词不触发', W.classifyAdReplyIntent('spammer') === '');
-	// 否定词必须永远优先：这些短句都含新触发词的子串。
-	assert('C1 「不要封」判为 negative', W.classifyAdReplyIntent('不要封') === 'negative');
-	assert('C1 「不该封」判为 negative', W.classifyAdReplyIntent('不该封') === 'negative');
-	assert('C1 「取消封禁」判为 negative', W.classifyAdReplyIntent('取消封禁') === 'negative');
-	assert('C1 「不是垃圾」判为 negative', W.classifyAdReplyIntent('不是垃圾') === 'negative');
-	assert('C1 「误封了」判为 negative', W.classifyAdReplyIntent('误封了') === 'negative');
-	assert('C1 not spam 判为 negative', W.classifyAdReplyIntent('not spam') === 'negative', W.classifyAdReplyIntent('not spam'));
+	// 【2026-09-12】否定词表同样清空：解封只走 /unban，不再有「打字即解封」这条路。
+	// 原先这一组钉死「否定词优先于肯定词」的顺序，现在两张表都空，顺序已无意义。
+	for (const phrase of ['不要封', '不该封', '取消封禁', '不是垃圾', '误封了', 'not spam']) {
+		assert('C1 「' + phrase + '」不再触发打字解封', W.classifyAdReplyIntent(phrase) === '',
+			W.classifyAdReplyIntent(phrase));
+	}
 	assert('C1 超 20 字仍不触发', W.classifyAdReplyIntent('这条消息我看了半天觉得应该算是广告吧你怎么看') === '');
 }
 
@@ -1778,22 +1784,18 @@ section('[13] 回复学习端到端（管理层回复即判定，误触发必须
 		return allSentText();
 	};
 
-	// 场景 1：管理层回复「这是广告」→ 强制判定为广告并走完整处置链。
+	// ===== 场景 1：打字触发整套下线（2026-09-12 主人定的口径）=====
+	// 原先这一组实测「管理层回复『这是广告』→ 强制判定 + 完整处置链」。
+	// 现在三张触发词表全部清空，同一条消息【什么都不该发生】——
+	// 封禁只走 /ban 与引用回复 /spam，解封只走 /unban。
 	const p1 = await sendReply(OWNER_ID, '这是广告', 72002);
-	assert('回复学习 positive：被举报者入黑名单', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72002'")[0].c === 1, JSON.stringify(env13.DB.query('SELECT id FROM blacklist')));
-	assert('回复学习 positive：执行了全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
-	assert('回复学习 positive：删了被举报消息与操作消息', countCalls('deleteMessage') >= 2, JSON.stringify(calls.map((c) => c.method)));
-	assert('回复学习 positive：学入了指纹', env13.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c > 0);
-	assert('回复学习 positive：指纹记为 manual', env13.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'manual'")[0].c > 0, JSON.stringify(env13.DB.query('SELECT value, source FROM ad_fingerprints')));
-	assert('回复学习 positive：追加了 reply 来源语义样本', env13.DB.query("SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE source = 'reply'")[0].c === 1, JSON.stringify(env13.DB.query("SELECT source FROM ad_sample_embeddings WHERE source != 'seed'")));
-	assert('回复学习 positive：群内有处置回执', p1.includes('已按广告处置 72002'), p1);
-	// 处置回执必须是「闪屏」：sendFlashMessage 靠 ctx.waitUntil 注册延时撤回，
-	// 调用方给 ctx 传 null 时撤回逻辑根本不会注册，回执会永久留在群里
-	// （内含被处置者 TGID 与内部指纹计数，不该长期公开展示）。这里断言后台任务确实被注册。
-	assert('回复学习 positive：回执注册了延时撤回任务', pendingWaits.length >= 1, '待执行后台任务数 ' + pendingWaits.length);
-	const deleteBeforeFlush = countCalls('deleteMessage');
-	await flushWaits();
-	assert('回复学习 positive：回执被自动撤回', countCalls('deleteMessage') > deleteBeforeFlush, '撤回前 ' + deleteBeforeFlush + ' 次，撤回后 ' + countCalls('deleteMessage') + ' 次');
+	assert('打字下线：不加黑', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72002'")[0].c === 0, JSON.stringify(env13.DB.query('SELECT id FROM blacklist')));
+	assert('打字下线：不封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('打字下线：不删任何消息', countCalls('deleteMessage') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('打字下线：群内无处置回执', !p1.includes('已按广告处置'), p1);
+	// 学习功能本身完全不受影响 —— 清空的只是「打字即触发处置」这条路。
+	// 指纹库里仍有种子数据，这条断言确保清空没有连带破坏既有指纹。
+	assert('打字下线：既有指纹未受影响（学习功能完好）', env13.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c > 0);
 
 	// 闪屏时长可配置：硬编码默认 5000ms，环境变量 FLASH_MESSAGE_TTL_MS 可覆盖。
 	// 校验规则与其它数值型配置一致 —— 空串/非整数/超范围一律回落默认值，
@@ -1811,13 +1813,11 @@ section('[13] 回复学习端到端（管理层回复即判定，误触发必须
 	await W.sendFlashMessage(GROUP_ID, '零时长提示', { waitUntil(p) { pendingWaits.push(Promise.resolve(p).catch(() => {})); } }, 0);
 	assert('闪屏时长：ttl=0 不注册撤回任务', pendingWaits.length === 0, '注册了 ' + pendingWaits.length + ' 个任务');
 
-	// 场景 2：同一管理层回复「不是广告」→ 纠错回滚，解黑 + 全群解封。
+	// 场景 2：否定词同样下线 —— 打字不再能解封，解封只走 /unban。
 	const p2 = await sendReply(OWNER_ID, '不是广告', 72002);
-	assert('回复学习 negative：已移出黑名单', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72002'")[0].c === 0, JSON.stringify(env13.DB.query('SELECT id FROM blacklist')));
-	assert('回复学习 negative：执行了解封', countCalls('unbanChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
-	assert('回复学习 negative：未再次封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
-	assert('回复学习 negative：给命中指纹记了误判', env13.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints WHERE false_positive_count > 0')[0].c > 0, JSON.stringify(env13.DB.query('SELECT value, false_positive_count FROM ad_fingerprints')));
-	assert('回复学习 negative：群内有回滚回执', p2.length > 0, p2);
+	assert('打字下线：不执行解封', countCalls('unbanChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('打字下线：不给指纹记误判', env13.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints WHERE false_positive_count > 0')[0].c === 0, JSON.stringify(env13.DB.query('SELECT value, false_positive_count FROM ad_fingerprints WHERE false_positive_count > 0')));
+	assert('打字下线：群内无回滚回执', !p2.includes('误判'), p2);
 
 	// 场景 3：旧词表会误封的正常回复，现在必须一条都不处置。
 	for (const [text, label] of [['学习了', '学习了'], ['already done', 'already done'], ['封面不错', '封面不错'], ['download 完成', 'download 完成'], ['admin 已看', 'admin 已看']]) {
@@ -1831,9 +1831,11 @@ section('[13] 回复学习端到端（管理层回复即判定，误触发必须
 	assert('回复学习：非管理层无权处置', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72005'")[0].c === 0, JSON.stringify(env13.DB.query('SELECT id FROM blacklist')));
 	assert('回复学习：非管理层不触发封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 
-	// 场景 5：目标是管理层时必须拒绝，且给出明确提示。
+	// 场景 5：打字下线后连「目标是管理层」这条拦截提示也不该出现 ——
+	// 线上主人引用管理层说「是广告」时弹出过这条闪屏，反而暴露了打字触发机制的存在。
+	// 现在整条路径静默，群内不留任何痕迹。
 	const p5 = await sendReply(OWNER_ID, '这是广告', OWNER_ID, '长期收购网赚账号 USDT');
-	assert('回复学习：目标是管理层时被拒', p5.includes('目标是管理层'), p5);
+	assert('打字下线：引用管理层完全静默（不再弹"目标是管理层"）', !p5.includes('目标是管理层'), p5);
 	assert('回复学习：管理层目标未入黑名单', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '" + OWNER_ID + "'")[0].c === 0);
 	assert('回复学习：管理层目标未被封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 
@@ -1855,7 +1857,9 @@ section('[13] 回复学习端到端（管理层回复即判定，误触发必须
 	await sendReply(OWNER_ID, '不是广告，解封', 72008, '大家早上好');
 	assert('申诉句：管理层回复时不封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 	assert('申诉句：管理层回复时目标未入黑名单', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72008'")[0].c === 0);
-	assert('申诉句：管理层回复时执行的是解封', countCalls('unbanChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	// 【2026-09-12】原断言「执行的是解封」依赖否定词表。词表清空后打字不再解封，
+	// 解封只走 /unban。这里改为验证：既不封也不解，整条路径静默。
+	assert('打字下线：申诉句既不封禁也不解封', countCalls('unbanChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 }
 
 section('[14] 两道闸真实场景回归（用线上真实指纹与漏放案例）');
