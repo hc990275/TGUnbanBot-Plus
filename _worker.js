@@ -12119,6 +12119,44 @@ function buildAdSampleText(payload) {
 	return normalizeAdSemanticText([payload?.name, payload?.bio, payload?.text].filter(Boolean).join(' ').trim());
 }
 
+// ===== 昵称剥离复验（2026-09-22 线上连环误封 7307358097 @svipultra）=====
+//
+// 【要治的病】这个号任意发言就被封，连发 5 次，相似度随封禁次数单调上升：
+//   0.794(#1722) → 0.798(#1883) → 0.811(#2010) → 0.815(#1881) → 0.828(#2014)
+// 这是一个自我强化闭环，四个环节咬在一起：
+//   ① 闸一的 bio 写死为空且 ban 就地处置，他 bio 里的豁免词（私聊 / Bot）从未被读到 → 得分 0
+//   ② 得分 0 时 #1615 那道 `score < 0` 的豁免否证不生效（0 < 0 为假）
+//   ③ 语义文本 = name + bio + text，bio 为空时「Angel 有毒」里昵称占 5/7 字 → 昵称主导向量
+//   ④ 每次误封都学一条「Angel ×××」进样本库 → 下次他说任何话都必然高相似
+// 关键事实：他被封时【得分 0、指纹层未命中、四通道结构查杀全放行】—— 四层里三层都说他没问题，
+// 只有 AI 层一个人定罪，而那个相似度完全是昵称跟库里 5 条「Angel ×××」重合刷出来的。
+//
+// 【为什么不调阈值、不改 buildAdSampleText 的拼法】
+//   · 调阈值（或把 `score < 0` 改成 `score <= 0`）是按样本调数字 —— 本项目在连带门槛上
+//     已经吃过三次这个教训（12 字 → 4 字 → 取消），下个样本 0.86 又要再调一轮。
+//   · 改 buildAdSampleText 去掉 name 会让全库存量样本的 adTextHash 全部失效，
+//     历史 /ignore 与 /unban 的回滚记录一次性作废，还会丢掉「昵称即广告」那类号的召回。
+//     所以【那个函数一个字都不动】，这里另开一个同源取材口径。
+//
+// 【改的是判据】AI 层定罪时，必须确认这份相似度不是只由「与广告话术无关的恒定字段」贡献的。
+// 落法就是把昵称剥掉重算一次：
+//   真广告号的话术写在 bio 与正文里（要让人看见广告，就得写在别人看得见的地方），
+//   剥掉昵称照样命中 → 定罪成立，召回零损失。
+//   Angel 剥掉昵称后只剩「有毒」两个字 → 什么都不像 → 降级为软加分。
+//
+// 【刻意与 buildAdSampleText 共用 normalizeAdSemanticText】复验文本与样本文本必须经过
+// 同一套链接归一化，否则一边把 URL 换成占位符、一边留着原文，两边的向量不可比。
+function buildAdSampleTextWithoutName(payload) {
+	return normalizeAdSemanticText([payload?.bio, payload?.text].filter(Boolean).join(' ').trim());
+}
+
+// 剥掉昵称之后还剩多少【实质广告话术】（再剥一层链接占位符，理由见 adSemanticCoreLength）。
+// 两端共用：检测端判「这次的相似度是否昵称独占贡献」，学习端判「这条样本值不值得入库」。
+// 一处定义保证两端永不分叉 —— 检测端 veto 了却照样把样本学进库，下次照样误封。
+function adSampleBodyCoreLength(payload) {
+	return adSemanticCoreLength(buildAdSampleTextWithoutName(payload));
+}
+
 // /addsample 底层：新增语义样本，向量留空由懒加载补齐。
 //
 // 【入口统一归一化】这里再套一次 normalizeAdSemanticText 不是多余：/addsample 是主人手打的
@@ -13149,6 +13187,11 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// （真正决定 verdict 与 layer 的地方）必须读到它 —— 只在 if 块里判断等于没改，
 	// 那里照样会用裸 ai.isMatch 定罪（离线实测踩到过：reasons 写了降级、verdict 仍是 ban）。
 	let aiExemptVeto = false;
+	// AI 硬命中是否被「昵称剥离复验」否证 —— 与 aiExemptVeto 同理，必须声明在 if 块外，
+	// 因为下面的 hardHit / layer 汇总点才是真正决定 verdict 的地方（#1615 已踩过这个坑：
+	// 只在 if 块里改 reasons，hardHit 读裸 ai.isMatch，结果 reasons 写了降级、verdict 仍是 ban）。
+	let aiNameStripVeto = false;
+	let aiNameStripNote = '';
 	// 【检测端与学习端共用同一个拼装函数】原来这里手写 join，与 buildAdSampleText 拼法碰巧一致
 	// 靠的是两处各自维护 —— 一改就会分叉。2026-09-09 加链接归一化时正式收敛到一处：
 	// payload 的 name / bio / text 与 buildAdSampleText 取的三个字段完全对应，
@@ -13172,14 +13215,54 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		// 这里改判据：负分意味着豁免词占了上风，此时 AI 硬命中降级为软加分，
 		// 让它回到「凑分」赛道而不是「秒杀」赛道。得分 ≥ 0 时 AI 硬命中照旧生效，召回不受影响。
 		aiExemptVeto = ai.isMatch && score < 0;
-		const exemptVeto = aiExemptVeto;
+
+		// ===== 昵称剥离复验（2026-09-22）=====
+		// 完整推演见 buildAdSampleTextWithoutName 处的注释。一句话：AI 层定罪前，
+		// 先确认这份相似度不是只由昵称这个「与广告话术无关的恒定字段」刷出来的。
+		//
+		// 【只挂在这一个分支上】ai.isMatch && !aiExemptVeto 是 AI 层唯一会单独定罪的入口。
+		// 评分层撞阈值、指纹层命中、四通道结构查杀这三条定罪路径完全不经过这里，
+		// 一行都没被碰到 —— 这是「现有功能不受影响」的落点。
+		if (ai.isMatch && !aiExemptVeto) {
+			const bodyCore = adSampleBodyCoreLength(payload);
+			if (bodyCore < AD_SAMPLE_MIN_CORE_LENGTH) {
+				// 剥掉昵称就没剩下实质话术 —— 相似度是昵称独占贡献的，不必再跑一次推理。
+				// 【这一步不花任何额外开销】checkAdAiSimilarity 对 < 4 字的文本本来就直接返回 0，
+				// 提前判断只是顺手省掉一次 D1 往返与一次 Workers AI 调用。
+				// 门槛复用 AD_SAMPLE_MIN_CORE_LENGTH 而不另立数字：它表达的正是
+				// 「这段文本有没有实质话术」，与入库门槛同一个语义，两处必须同进同退。
+				aiNameStripVeto = true;
+				aiNameStripNote = '剥离昵称后仅剩 ' + bodyCore + ' 字实质话术（不足 '
+					+ AD_SAMPLE_MIN_CORE_LENGTH + ' 字）';
+			} else {
+				// 还有实质话术 → 老老实实再嵌入一次比对。真广告号走的就是这条路，
+				// 而它们的话术本来就在 bio / 正文里，剥掉昵称照样命中，结论不变。
+				const recheck = await checkAdAiSimilarity(env, buildAdSampleTextWithoutName(payload), { config });
+				if (!recheck.isMatch) {
+					aiNameStripVeto = true;
+					aiNameStripNote = '剥离昵称后相似度降至 ' + Number(recheck.similarity || 0).toFixed(3)
+						+ '（< 阈值 ' + config.aiSimilarityThreshold + '）';
+				}
+			}
+		}
+
+		const exemptVeto = aiExemptVeto || aiNameStripVeto;
 		if (ai.isMatch && !exemptVeto) {
 			layer = 'ai';
 			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold);
-		} else if (exemptVeto) {
+		} else if (aiExemptVeto) {
 			score += AD_AI_SOFT_BONUS_SCORE;
 			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold
 				+ '，但豁免词已判负（得分 ' + (score - AD_AI_SOFT_BONUS_SCORE) + '）→ 降级为 +'
+				+ AD_AI_SOFT_BONUS_SCORE + ' 软加分，不直接定罪');
+		} else if (aiNameStripVeto) {
+			// 与豁免词否证走【同一条降级通道】，不是放行 —— 只是把它从「秒杀」赛道
+			// 踢回「凑分」赛道。昵称本身确实是广告的号（「【出租账号】收U」这一类）不会因此漏掉：
+			// scoreAdProfile 照常给昵称里的广告词计分，四通道的 card / identity 照常盯着昵称，
+			// 再加上这 2 分，该撞封禁线的照样撞。被 veto 掉的只有「AI 单独秒杀」这一种最弱形态。
+			score += AD_AI_SOFT_BONUS_SCORE;
+			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold
+				+ '，但' + aiNameStripNote + '，相似度由昵称贡献 → 降级为 +'
 				+ AD_AI_SOFT_BONUS_SCORE + ' 软加分，不直接定罪');
 		} else if (ai.isSoft) {
 			score += AD_AI_SOFT_BONUS_SCORE;
@@ -13228,7 +13311,7 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// 【必须在这里生效，不能只改上面那个 reasons 分支】这里才是决定 verdict 与 layer 的地方；
 	// 线上误封 #1615 的样本离线实测正是这样：reasons 已写「降级为软加分」，
 	// 而 hardHit 读裸 ai.isMatch 照样定罪、layer 照样标 ai。
-	const aiHardHit = Boolean(ai.isMatch) && !aiExemptVeto;
+	const aiHardHit = Boolean(ai.isMatch) && !aiExemptVeto && !aiNameStripVeto;
 	const hardHit = fingerprintBan || aiHardHit || structureBan;
 	const verdict = (score >= config.scoreThreshold || hardHit)
 		? 'ban'
@@ -13261,6 +13344,10 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		retainScore: Math.max(0, behaviorScore),
 		aiSimilarity: ai.similarity,
 		aiSample: ai.sample,
+		// 昵称剥离复验是否否决了这次 AI 硬命中。透传给处置端与测试：
+		// 处置端据此决定「这条要不要学进样本库」（学习端复检见 enforceAdDetection），
+		// 测试据此断言「被拦下的是 AI 秒杀而不是整条判定」。
+		aiNameStripVeto,
 		payload,
 		// bioChecked 区分「查过 bio 且为空」与「本次没查 bio」。
 		// 这两者在 snapshot.bio 里长得一模一样（都是空串），但对人的意义完全不同：
@@ -13412,13 +13499,31 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		// 那条路径碰到「本人正文一个字母 + 广告全在引用块里」时会拿引用体当样本，
 		// 比这里默认的 name + bio + text 准得多。有覆盖就用覆盖，避免同一次处置写两条样本
 		// （其中一条还是「英文人名 + 单字母」那种纯噪声）。
-		const sampleText = options.sampleText != null
+		const sampleOverridden = options.sampleText != null;
+		const sampleText = sampleOverridden
 			? String(options.sampleText).trim()
 			: buildAdSampleText(evaluation.payload);
+		// ===== 剥昵称复检：断掉「误封 → 学样本 → 下次更容易误封」的闭环（2026-09-22）=====
+		//
+		// 这是 @svipultra 连环误封的第 ④ 环，也是让相似度单调爬升的那一环：
+		// 每误封一次就把「Angel ×××」学进样本库，下次他说任何话，昵称都跟库里的样本重合，
+		// 相似度必然更高 —— 0.794 → 0.798 → 0.811 → 0.815 → 0.828，五次封禁一次比一次稳。
+		// 检测端的昵称剥离复验（见 evaluateAdSuspect）已经拦住了这类定罪，但那只挡住了「入口」；
+		// 样本仍可能从别的定罪层（评分层撞阈值、结构查杀）流进来，所以出口也必须堵。
+		// 两端共用 adSampleBodyCoreLength，保证判据永不分叉。
+		//
+		// 【存进去的仍是完整文本，拼法一个字都没动】收紧的只是「准不准进」这道闸 ——
+		// buildAdSampleText 照旧返回 name + bio + text，adTextHash 因此完全不变，
+		// 全库存量样本与历史 /ignore、/unban 的双 hash 试删【全部继续有效】。
+		//
+		// 【/spam 回复学习不受此闸约束】options.sampleText 覆盖时取材的是引用体正文，
+		// 那段文本本来就不含昵称，再套一次剥昵称检查等于凭空多一道无关门槛。
+		const sampleSubstantial = sampleOverridden
+			|| adSampleBodyCoreLength(evaluation.payload) >= AD_SAMPLE_MIN_CORE_LENGTH;
 		// 长度门槛与 addAdSample 内部一致（< 4 字符直接拒），这里先判一次是为了少一次 D1 往返。
 		// 引用体形态的号（本人正文只有一个字母）在这里拼出来的通常只有昵称，
 		// 短到 4 字符以下就跳过 —— 那种样本语义太稀薄，进库只会拉高误判面。
-		if (sampleText.length >= 4) {
+		if (sampleText.length >= 4 && sampleSubstantial) {
 			const sample = await addAdSample(env, sampleText, { source: String(options.sampleSource || 'auto') });
 			sampleAdded = Boolean(sample?.ok && sample?.added);
 		}
@@ -13780,31 +13885,74 @@ async function detectAdOnMessage(message, env) {
 
 	const needBio = shouldCheckAdBio(member, nowSeconds);
 
+	// ===== AI 层单独定罪 → 强制补查 bio 再复评（2026-09-22）=====
+	//
+	// 这是 @svipultra 连环误封的第 ①② 环：闸一的 bio 写死为空 + ban 就地返回，
+	// 于是他简介里的「私聊」「Bot」两个豁免词【从头到尾没被读到过】，得分停在 0；
+	// 而 #1615 那道豁免否证的条件是 score < 0，0 < 0 为假，那道闸也跟着失效。
+	// 查一次 bio 就能同时解决这两环 —— 豁免词一进来分就是负的，现成的 aiExemptVeto 自动生效。
+	//
+	// 【触发条件刻意收到最窄】必须同时满足：
+	//   · verdict 是 ban（不是 ban 的本来就要往下走闸二，不归这里管）
+	//   · layer === 'ai'（AI 层定的罪）
+	//   · score < 封禁线（评分层自己没撞线 —— 撞了线就不是「AI 单独定罪」）
+	// 所以评分层撞阈值、指纹层命中、四通道结构查杀这三种定罪【照旧就地处置，
+	// 一次 getChat 都不会多花】。只有「四层里唯独 AI 说有罪」这一种最弱的证据形态才补查。
+	//
+	// 【为什么无视 bio 冷却期】shouldCheckAdBio 是给稳态聊天做节流的，而这里是一次
+	// 即将发生的封禁。@svipultra 早就有 bio_checked_at 了，尊重冷却期等于第 2 次之后
+	// 永远查不到他的简介 —— 那正是他连中 5 次的原因。AI 单独定罪本身是低频事件，
+	// 为它多花一个 Telegram 请求，换的是把误封挡在发生之前。
+	let decision = cheap;
+	let bioVerified = false;
+	if (cheap.verdict === 'ban' && cheap.layer === 'ai' && cheap.score < config.scoreThreshold) {
+		const verifyProfile = await fetchAdUserProfile(userId, from);
+		// 与闸二同口径：不查 getChatMember，status 留空由 formatAdMemberStatus 渲染成「未查询」。
+		verifyProfile.status = '';
+		await markAdBioChecked(env, userId, nowSeconds);
+		// 只在真拿到 bio 时才改判。getChat 失败（多半是 429）时维持闸一结论 ——
+		// 拿不到证据不等于证据不利，但也不能让一次网络抖动把该封的号放过去。
+		if (verifyProfile.bioFetched === true) {
+			bioVerified = true;
+			decision = applyHistory(await evaluateAdSuspect(
+				env,
+				{ profile: verifyProfile, text: text || contactName, quotedText, forwardChat },
+				// 这次是【据实传】：bio 真查到了，空简介该减分就减分。
+				{ config, whitelist }
+			));
+			console.log('[广告检测] AI 单独定罪已补查 bio 复评 user=' + userId
+				+ ' 闸一=' + cheap.verdict + '/' + cheap.score
+				+ ' 复评=' + decision.verdict + '/' + decision.score);
+		}
+	}
+
 	// 闸一够封禁线就地处置，不再花 getChat —— 已经确定要封的人，bio 是什么无关紧要。
-	if (cheap.verdict === 'ban') {
+	// （唯一的例外是上面那段 AI 单独定罪的补查，它已经把 decision 换成复评结论了。）
+	if (decision.verdict === 'ban') {
 		await enforceAdDetection(env, {
 			userId,
 			chatId: chat.id,
 			chatTitle: chat.title || '',
 			messageId: message.message_id
-		}, cheap, { config, whitelist });
+		}, decision, { config, whitelist });
 		return true;
 	}
 
 	// 闸一没定罪、且这个人的 bio 在冷却期内 —— 到此结束，本条消息 0 个 Telegram 请求。
 	// 这是稳态下的绝大多数情况（正常聊天），也是「不要每条信息都拉」的落点。
-	if (!needBio) {
-		if (cheap.verdict === 'observe') {
+	// bioVerified 短路：上面补查时已经拉过 bio 并复评过了，再进闸二就是拉第二次。
+	if (!needBio || bioVerified) {
+		if (decision.verdict === 'observe') {
 			await upsertAdScreening(env, userId, {
 				chatId: chat.id,
 				// 只存行为分，见 retainScore 说明。
-				score: cheap.retainScore ?? 0,
-				reasons: cheap.reasons,
-				snapshot: cheap.snapshot,
-				layer: cheap.layer
+				score: decision.retainScore ?? 0,
+				reasons: decision.reasons,
+				snapshot: decision.snapshot,
+				layer: decision.layer
 			}, config);
-			console.log('[广告检测] 闸一转入观察 user=' + userId + ' score=' + cheap.score + '/' + config.scoreThreshold
-				+ ' 留存行为分=' + (cheap.retainScore ?? 0));
+			console.log('[广告检测] 闸一转入观察 user=' + userId + ' score=' + decision.score + '/' + config.scoreThreshold
+				+ ' 留存行为分=' + (decision.retainScore ?? 0));
 		}
 		return false;
 	}
