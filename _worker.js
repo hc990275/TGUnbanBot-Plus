@@ -7668,6 +7668,23 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const isAdmin = isPrivilegedManager(userId);
 		const quietGroupCommand = isInGroup && isConfiguredSourceGroup && !isPrimaryOwner(userId);
 
+		// ===== 副主人与超级管理员的 /check 命令消息保留在群里（2026-09-23 主人指定）=====
+		// 【只摘掉「撤回」这一个动作】quietGroupCommand 的其余语义对这两类角色一律不变：
+		// 不发「正在查询…」、不发 5 秒闪屏、完整结果仍然只进第一主人私聊。
+		//
+		// 【下面两处必须写成嵌套 if，不能合并成 `if (quietGroupCommand && !keep…)`】
+		// 带 TGID 参数那一路的 else 分支会往群里发「正在查询…」—— 合并之后这些角色就掉进
+		// 了 else，群里反而冒出一条机器人回执，与「群内零回执」的要求正好相反。
+		//
+		// 【刻意写成显式枚举，不写成 `keep = quietGroupCommand`】两者当前等价 ——
+		// 能走到这里的只有 isPrivilegedManager（主人 + 副主人 + 超管），第一主人又已被
+		// quietGroupCommand 的 !isPrimaryOwner 排除。但写死等价式会让【将来任何新放开的
+		// 角色自动继承「不撤回」】，那是主人没点过头的行为。枚举则让新角色默认照旧撤回。
+		// 匿名管理员走不到这里：其 userId 是 GroupAnonymousBot，isPrivilegedManager 判 false，
+		// 上面 !isAdmin 就已 return（test_kick.mjs:5131 锁着这条）。
+		const keepGroupCommandMessage = quietGroupCommand
+			&& (isSecondaryOwner(userId) || isSuperAdmin(userId));
+
 		if (hasTgidArg) {
 			// 带 TGID 参数:私聊 / 群内均可
 			if (!isAdmin) {
@@ -7677,7 +7694,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				return;
 			}
 			if (quietGroupCommand) {
-				await deleteAuthorizedGroupCommandMessage(message, '/check');
+				if (!keepGroupCommandMessage) {
+					await deleteAuthorizedGroupCommandMessage(message, '/check');
+				}
 			} else {
 				await sendTelegramMessage(chatId, `正在查询 TGID: <code>${escapeHtml(checkArg)}</code> 的封禁状态...`);
 			}
@@ -7712,7 +7731,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 		if (quietGroupCommand) {
-			await deleteAuthorizedGroupCommandMessage(message, '/check');
+			// 与上面带 TGID 参数那一路同构：只摘掉撤回，其余静默语义不变。
+			// 这里当前没有 else 分支，合并写法暂时也安全 —— 但仍刻意写成嵌套 if，
+			// 免得后人给这处补 else 时踩上面注释里写的那个坑。
+			if (!keepGroupCommandMessage) {
+				await deleteAuthorizedGroupCommandMessage(message, '/check');
+			}
 		}
 		const repliedUser = message.reply_to_message?.from;
 		if (!repliedUser?.id) {

@@ -5103,7 +5103,40 @@ console.log('\n[78] /check TGID 双库查询与纯复制操作');
 	assert('超级管理员群内 /check 完整结果发给主人', !!ownerCheckResult && ownerCheckResult.body.text.includes('封禁查询结果'));
 	assert('超级管理员群内 /check 复制按钮完整发给主人', ownerCheckButtons.length === 2 && ownerCheckButtons.every((button) => !!button.copy_text?.text));
 	assert('超级管理员群内 /check 不私聊发令者', !superTriggerDm);
-	assert('超级管理员群内 /check 删除命令消息', callsOf('deleteMessage').length >= 1);
+	assert('超级管理员群内 /check 不撤回命令消息', callsOf('deleteMessage').length === 0);
+
+	// 副主人（OWNER_IDS 第二位）与超管同口径：命令消息留在群里，其余静默语义一个字不变。
+	// 【必须单独测一遍，不能只测超管】keepGroupCommandMessage 写的是
+	// `isSecondaryOwner(userId) || isSuperAdmin(userId)` 显式枚举，少测一边就查不出
+	// 有人把某个分支删掉 —— 而删掉的后果是那类角色的命令消息又被悄悄撤回。
+	const deputyEnv = { TOKEN, BOT_TOKEN: '0:fake', GROUP_ID: '-1001,-1002', OWNER_IDS: '999,888', SUPER_ADMINS: '7777', DB: makeFakeDB([localEntry]) };
+	check = await runCheck({
+		gky: GKY_CONFIGURED,
+		env: deputyEnv,
+		chat: { id: -1001, type: 'supergroup', title: '配置群' },
+		from: { id: 888, is_bot: false, first_name: '副主人' },
+	});
+	const deputyGroupSends = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '-1001');
+	const deputyOwnerResult = callsOf('sendMessage').filter((c) => String(c.body.chat_id) === '999').at(-1);
+	const deputyTriggerDm = callsOf('sendMessage').find((c) => String(c.body.chat_id) === '888');
+	assert('副主人群内 /check 不撤回命令消息', callsOf('deleteMessage').length === 0);
+	assert('副主人群内 /check 零机器人回执', deputyGroupSends.length === 0);
+	assert('副主人群内 /check 完整结果发给第一主人', !!deputyOwnerResult && deputyOwnerResult.body.text.includes('封禁查询结果'));
+	assert('副主人群内 /check 不私聊发令者', !deputyTriggerDm);
+
+	// 第一主人同样不撤回，但【原因完全不同】：他连 quietGroupCommand 都不成立
+	// （:7669 的 !isPrimaryOwner 把他排除了），走的是往群里发回执的公开路径。
+	// 这条断言锁的就是这个差异 —— 防的是有人把判据简化成 `keep = quietGroupCommand`
+	// 之后又反手去动 quietGroupCommand 的定义，两条路径就一起塌了。
+	check = await runCheck({
+		gky: GKY_CONFIGURED,
+		env: { ...deputyEnv, DB: makeFakeDB([localEntry]) },
+		chat: { id: -1001, type: 'supergroup', title: '配置群' },
+		from: { id: 999, is_bot: false, first_name: '主人' },
+	});
+	assert('第一主人群内 /check 走公开路径:不撤回且群内有回执',
+		callsOf('deleteMessage').length === 0
+		&& callsOf('sendMessage').some((c) => String(c.body.chat_id) === '-1001'));
 
 	check = await runCheck({ gky: GKY_CONFIGURED, env: { ...superEnv, DB: makeFakeDB([localEntry]) }, chat: { id: 7777, type: 'private' }, from: { id: 7777, is_bot: false, first_name: '超级管理员' } });
 	assert('超级管理员私聊 /check 仍直接收到完整结果', String(check.result?.body.text || '').includes('封禁查询结果') && check.copies.length === 2);
